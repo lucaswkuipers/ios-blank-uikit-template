@@ -10,6 +10,7 @@ final class SceneDelegate: UIResponder, UIApplicationDelegate, UIWindowSceneDele
         options connectionOptions: UIScene.ConnectionOptions
     ) {
         window = UIWindow(windowScene: scene as! UIWindowScene)
+        window!.rootViewController = ViewController()
         window!.makeKeyAndVisible()
     }
 }
