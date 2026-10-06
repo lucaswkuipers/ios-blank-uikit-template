@@ -21,6 +21,29 @@ struct ShelfCatalog: Codable {
     var applications: [ShelfApplication]
 }
 
+struct ShelfDeliveryState: Codable {
+    let commit: String
+    let build: String
+
+    static func reserve(bundle: String, commit: String, minimum: String, directory: URL) throws -> Self {
+        try validate(bundle, pattern: "^com\\.lucaswkuipers\\.[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)*$", label: "personal bundle identifier")
+        let path = directory.appendingPathComponent("direct-deliveries/\(bundle).json")
+        if files.fileExists(atPath: path.path) {
+            let saved = try JSONDecoder().decode(Self.self, from: Data(contentsOf: path))
+            if saved.commit == commit, saved.build.compare(minimum, options: .numeric) != .orderedAscending {
+                _ = try nextBuildNumber(saved.build)
+                return saved
+            }
+        }
+        let build = try reserveBuildNumber(bundle: bundle, minimum: minimum, directory: directory.appendingPathComponent("build-numbers"))
+        let state = Self(commit: commit, build: build)
+        try files.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try JSONEncoder().encode(state).write(to: path, options: .atomic)
+        try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+        return state
+    }
+}
+
 struct ShelfAsset: Decodable {
     let id: Int
     let name: String
@@ -170,8 +193,12 @@ func withShelfLock<T>(_ operation: () throws -> T) throws -> T {
     let descriptor = open(path.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
     guard descriptor >= 0 else { throw CommandError(message: "Cannot open shelf lock.") }
     defer { close(descriptor) }
-    guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
-        throw CommandError(message: "Another shelf publish or link refresh is running. Retry shortly.")
+    let deadline = Date().addingTimeInterval(30)
+    while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+        guard errno == EWOULDBLOCK, Date() < deadline else {
+            throw CommandError(message: "Another shelf catalog update is still running. Retry shortly.")
+        }
+        Thread.sleep(forTimeInterval: 0.2)
     }
     return try operation()
 }
@@ -211,6 +238,13 @@ func setupShelfRefresh() throws {
 func deliverDirect(directory: String) throws {
     let root = URL(fileURLWithPath: directory).standardizedFileURL.resolvingSymlinksInPath()
     let metadata = try JSONDecoder().decode(Project.self, from: Data(contentsOf: root.appendingPathComponent(".uikit-app.json")))
+    try validate(metadata.bundleIdentifier, pattern: "^com\\.lucaswkuipers\\.[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)*$", label: "personal bundle identifier")
+    let lockDirectory = TestFlightConfiguration.directory.appendingPathComponent("locks")
+    try files.createDirectory(at: lockDirectory, withIntermediateDirectories: true)
+    let descriptor = open(lockDirectory.appendingPathComponent("\(metadata.bundleIdentifier).lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+    guard descriptor >= 0 else { throw CommandError(message: "Cannot open delivery lock.") }
+    defer { close(descriptor) }
+    guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else { throw CommandError(message: "Another delivery is already running for this app.") }
     let store = try ShelfStore()
     _ = try store.github.repository(name: metadata.name)
     try verifyPersonalRemote(store.github.git(root, ["remote", "get-url", "origin"], remote: false), name: metadata.name)
@@ -218,55 +252,75 @@ func deliverDirect(directory: String) throws {
         throw CommandError(message: "Commit app changes before direct delivery.")
     }
     let commit = try store.github.git(root, ["rev-parse", "HEAD"], remote: false)
+    let (_, previous) = try store.catalog()
+    if let application = previous.applications.first(where: { $0.bundleIdentifier == metadata.bundleIdentifier && $0.sourceCommit == commit }), application.profileExpiration > Date().addingTimeInterval(86400) {
+        _ = try withShelfLock { try store.refresh() }
+        try emit(["result": "available-in-shelf", "app": metadata.name, "build": application.build, "team": TestFlightConfiguration.personalTeam, "sourcesChanged": "false"])
+        return
+    }
+    let previousBuild = previous.applications.first(where: { $0.bundleIdentifier == metadata.bundleIdentifier })?.build
+    let client = try AppStoreClient(configuration: TestFlightConfiguration.load())
+    try client.verifyPersonalAccount()
+    let apps = try client.list("/v1/apps", query: ["filter[bundleId]": metadata.bundleIdentifier])
+    var minimum = try nextBuildNumber(previousBuild)
+    if let app = apps.first {
+        let flight = try nextAppleBuildNumber(appID: app.id, client: client)
+        if flight.compare(minimum, options: .numeric) == .orderedDescending { minimum = flight }
+    }
+    let build = try ShelfDeliveryState.reserve(bundle: metadata.bundleIdentifier, commit: commit, minimum: minimum, directory: TestFlightConfiguration.directory).build
+    let package = try packageDirect(directory: directory, build: build)
+    let tag = "\(metadata.name)-\(build)-\(commit.prefix(12))"
+    let releasesOutput = try store.github.call(["api", "--paginate", "--slurp", "repos/\(ShelfStore.repository)/releases?per_page=100"])
+    let releases = try store.decoder.decode([[ShelfRelease]].self, from: Data(releasesOutput.utf8)).flatMap { $0 }
+    var artifactRelease: ShelfRelease
+    if let existing = releases.first(where: { release in
+        if release.tag_name == tag { return true }
+        guard release.draft, let body = release.body,
+              let intent = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any] else { return false }
+        return intent["sourceCommit"] as? String == commit && intent["bundleIdentifier"] as? String == metadata.bundleIdentifier && intent["build"] as? String == build
+    }) {
+        artifactRelease = existing
+    } else {
+        let request = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? files.removeItem(at: request) }
+        let intent = String(decoding: try JSONSerialization.data(withJSONObject: ["sourceCommit": commit, "bundleIdentifier": metadata.bundleIdentifier, "build": build]), as: UTF8.self)
+        try JSONSerialization.data(withJSONObject: ["tag_name": tag, "name": "\(metadata.name) \(package.version) (\(build))", "body": intent, "draft": true]).write(to: request, options: .atomic)
+        let output = try store.github.call(["api", "--method", "POST", "repos/\(ShelfStore.repository)/releases", "--input", request.path])
+        artifactRelease = try store.decoder.decode(ShelfRelease.self, from: Data(output.utf8))
+    }
+    let application: ShelfApplication
+    if !artifactRelease.draft {
+        guard let body = artifactRelease.body else { throw CommandError(message: "Published release has no metadata.") }
+        let existing = try store.decoder.decode(ShelfApplication.self, from: Data(body.utf8))
+        guard existing.sourceCommit == commit, existing.bundleIdentifier == metadata.bundleIdentifier, existing.build == build else {
+            throw CommandError(message: "Published release differs from this package. Immutable assets were preserved.")
+        }
+        application = existing
+    } else {
+        for asset in artifactRelease.assets {
+            try store.github.call(["api", "--method", "DELETE", "repos/\(ShelfStore.repository)/releases/assets/\(asset.id)"])
+        }
+        let asset = try store.upload(URL(fileURLWithPath: package.path), name: "\(metadata.name).ipa", contentType: "application/octet-stream", releaseID: artifactRelease.id)
+        guard asset.size == package.size, asset.digest == "sha256:\(package.sha256)" else {
+            throw CommandError(message: "GitHub's uploaded package size or checksum differs. The release remains a draft.")
+        }
+        application = ShelfApplication(name: package.name, bundleIdentifier: package.bundleIdentifier, version: package.version, build: package.build, minimumOSVersion: package.minimumOSVersion, profileExpiration: package.profileExpiration, sourceCommit: commit, sha256: package.sha256, size: package.size, packageAssetID: asset.id, publishedAt: Date(), manifestAssetID: nil, installExpiration: nil)
+        try store.updateBody(application, releaseID: artifactRelease.id)
+        let request = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? files.removeItem(at: request) }
+        try JSONSerialization.data(withJSONObject: ["tag_name": tag, "draft": false, "make_latest": "false"]).write(to: request, options: .atomic)
+        let output = try store.github.call(["api", "--method", "PATCH", "repos/\(ShelfStore.repository)/releases/\(artifactRelease.id)", "--input", request.path])
+        let published = try store.decoder.decode(ShelfRelease.self, from: Data(output.utf8))
+        guard !published.draft, published.tag_name == tag, published.assets.contains(where: { $0.id == asset.id }) else {
+            throw CommandError(message: "GitHub did not confirm the complete published release. Retry to reconcile this build.")
+        }
+    }
     try withShelfLock {
-        let (release, previous) = try store.catalog()
-        if let application = previous.applications.first(where: { $0.bundleIdentifier == metadata.bundleIdentifier && $0.sourceCommit == commit }), application.profileExpiration > Date().addingTimeInterval(86400) {
-            _ = try store.refresh()
-            try emit(["result": "available-in-shelf", "app": metadata.name, "build": application.build, "team": TestFlightConfiguration.personalTeam, "sourcesChanged": "false"])
-            return
+        let (release, latest) = try store.catalog()
+        var updated = latest
+        if let current = latest.applications.first(where: { $0.bundleIdentifier == application.bundleIdentifier }), current.build.compare(build, options: .numeric) == .orderedDescending {
+            throw CommandError(message: "A newer build is already available in the shelf. It was preserved.")
         }
-        let previousBuild = previous.applications.first(where: { $0.bundleIdentifier == metadata.bundleIdentifier })?.build
-        let client = try AppStoreClient(configuration: TestFlightConfiguration.load())
-        try client.verifyPersonalAccount()
-        let apps = try client.list("/v1/apps", query: ["filter[bundleId]": metadata.bundleIdentifier])
-        var build = try nextBuildNumber(previousBuild)
-        if let app = apps.first {
-            let flight = try newDelivery(fingerprint: "", appID: app.id, bundle: metadata.bundleIdentifier, cache: files.temporaryDirectory, client: client)
-            if flight.buildNumber.compare(build, options: .numeric) == .orderedDescending { build = flight.buildNumber }
-        }
-        let package = try packageDirect(directory: directory, build: build)
-        let tag = "\(metadata.name)-\(build)-\(commit.prefix(12))"
-        let releasesOutput = try store.github.call(["api", "--paginate", "--slurp", "repos/\(ShelfStore.repository)/releases?per_page=100"])
-        let releases = try store.decoder.decode([[ShelfRelease]].self, from: Data(releasesOutput.utf8)).flatMap { $0 }
-        var artifactRelease: ShelfRelease
-        if let existing = releases.first(where: { $0.tag_name == tag }) {
-            artifactRelease = existing
-        } else {
-            try store.github.call(["release", "create", tag, "--repo", ShelfStore.repository, "--draft", "--title", "\(metadata.name) \(package.version) (\(build))", "--notes", "Preparing signed personal app"])
-            let output = try store.github.call(["api", "repos/\(ShelfStore.repository)/releases/tags/\(tag)"])
-            artifactRelease = try store.decoder.decode(ShelfRelease.self, from: Data(output.utf8))
-        }
-        let application: ShelfApplication
-        if !artifactRelease.draft {
-            guard let body = artifactRelease.body else { throw CommandError(message: "Published release has no metadata.") }
-            let existing = try store.decoder.decode(ShelfApplication.self, from: Data(body.utf8))
-            guard existing.sourceCommit == commit, existing.bundleIdentifier == metadata.bundleIdentifier, existing.build == build else {
-                throw CommandError(message: "Published release differs from this package. Immutable assets were preserved.")
-            }
-            application = existing
-        } else {
-            for asset in artifactRelease.assets {
-                try store.github.call(["api", "--method", "DELETE", "repos/\(ShelfStore.repository)/releases/assets/\(asset.id)"])
-            }
-            let asset = try store.upload(URL(fileURLWithPath: package.path), name: "\(metadata.name).ipa", contentType: "application/octet-stream", releaseID: artifactRelease.id)
-            guard asset.size == package.size, asset.digest == "sha256:\(package.sha256)" else {
-                throw CommandError(message: "GitHub's uploaded package size or checksum differs. The release remains a draft.")
-            }
-            application = ShelfApplication(name: package.name, bundleIdentifier: package.bundleIdentifier, version: package.version, build: package.build, minimumOSVersion: package.minimumOSVersion, profileExpiration: package.profileExpiration, sourceCommit: commit, sha256: package.sha256, size: package.size, packageAssetID: asset.id, publishedAt: Date(), manifestAssetID: nil, installExpiration: nil)
-            try store.updateBody(application, releaseID: artifactRelease.id)
-            try store.github.call(["release", "edit", tag, "--repo", ShelfStore.repository, "--draft=false", "--latest=false"])
-        }
-        var updated = previous
         let currentMain = try store.github.call(["api", "repos/lucaswkuipers/\(metadata.name)/git/ref/heads/main", "--jq", ".object.sha"])
         guard currentMain == commit else {
             throw CommandError(message: "Main has a newer commit. This build was retained in release history without replacing the current shelf app.")
@@ -276,6 +330,6 @@ func deliverDirect(directory: String) throws {
         updated.applications.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         try store.updateBody(updated, releaseID: release.id)
         _ = try store.refresh()
-        try emit(["result": "available-in-shelf", "app": metadata.name, "build": build, "team": TestFlightConfiguration.personalTeam, "sourcesChanged": String(try sourceFingerprint(root) != package.fingerprint)])
     }
+    try emit(["result": "available-in-shelf", "app": metadata.name, "build": build, "team": TestFlightConfiguration.personalTeam, "sourcesChanged": String(try sourceFingerprint(root) != package.fingerprint)])
 }

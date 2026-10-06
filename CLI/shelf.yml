@@ -1,0 +1,30 @@
+name: Personal AppShelf
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-shelf
+  cancel-in-progress: false
+
+jobs:
+  deliver:
+    if: github.repository_owner == 'lucaswkuipers' && github.event.repository.private == true && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, macOS, ARM64, uikit-app-personal]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Deliver to the personal shelf
+        shell: bash
+        run: |
+          set -euo pipefail
+          result=$("$HOME/.local/bin/uikit-app" direct "$GITHUB_WORKSPACE")
+          printf '%s\n' "$result"
+          [[ "$result" == *'"result":"available-in-shelf"'* ]]
+          [[ "$result" == *'"sourcesChanged":"false"'* ]]

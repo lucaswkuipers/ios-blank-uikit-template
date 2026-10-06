@@ -114,12 +114,12 @@ func publish(directory: String) throws {
     let commit = try github.git(root, ["rev-parse", "HEAD"], remote: false)
     try github.git(root, ["remote", "set-url", "origin", "git@github.com-personal:lucaswkuipers/\(metadata.name).git"], remote: false)
     try github.git(root, ["push", "origin", "main"], remote: true)
-    status("Waiting for GitHub's TestFlight delivery of \(commit.prefix(7))…")
+    status("Waiting for GitHub's \(metadata.route.rawValue) delivery of \(commit.prefix(7))…")
     let deadline = Date().addingTimeInterval(3000)
     let registrationDeadline = Date().addingTimeInterval(90)
     var previousStatus = ""
     while Date() < deadline {
-        let output = try github.call(["run", "list", "--repo", repository.nameWithOwner, "--workflow", "testflight.yml", "--commit", commit, "--json", "databaseId,status,conclusion,url", "--limit", "1"])
+        let output = try github.call(["run", "list", "--repo", repository.nameWithOwner, "--workflow", metadata.route.workflow, "--commit", commit, "--json", "databaseId,status,conclusion,url", "--limit", "1"])
         let runs = try JSONDecoder().decode([DeliveryRun].self, from: Data(output.utf8))
         if let delivery = runs.first {
             if delivery.status != previousStatus {
@@ -128,23 +128,23 @@ func publish(directory: String) throws {
             }
             if delivery.status == "completed" {
                 guard delivery.conclusion == "success" else {
-                    throw CommandError(message: "TestFlight workflow finished with \(delivery.conclusion): \(delivery.url). Fix or rerun this workflow; the CLI retains resumable delivery state.")
+                    throw CommandError(message: "Delivery workflow finished with \(delivery.conclusion): \(delivery.url). Fix or rerun this workflow; the CLI retains resumable delivery state.")
                 }
                 let logs = try github.call(["run", "view", String(delivery.databaseId), "--repo", repository.nameWithOwner, "--log"])
                 for line in logs.split(separator: "\n").reversed() {
                     guard let start = line.firstIndex(of: "{"),
                           let result = try? JSONDecoder().decode([String: String].self, from: Data(line[start...].utf8)),
-                          result["result"] == "available-to-internal-tester", result["sourcesChanged"] == "false",
+                          result["result"] == metadata.route.successResult, result["sourcesChanged"] == "false",
                           result["team"] == TestFlightConfiguration.personalTeam else {
                         continue
                     }
                     try emit(result.merging(["repository": repository.url, "workflow": delivery.url, "commit": commit], uniquingKeysWith: { _, new in new }))
                     return
                 }
-                throw CommandError(message: "Workflow succeeded but did not confirm personal TestFlight availability: \(delivery.url)")
+                throw CommandError(message: "Workflow succeeded but did not confirm personal \(metadata.route.rawValue) availability: \(delivery.url)")
             }
         } else if Date() > registrationDeadline {
-            throw RequiredAction(result: "needs-workflow-run", message: "No delivery run exists for this commit. The starter intentionally skips CI.", command: "gh workflow run testflight.yml --repo \(repository.nameWithOwner) --ref main")
+            throw RequiredAction(result: "needs-workflow-run", message: "No delivery run exists for this commit. The starter intentionally skips CI.", command: "gh workflow run \(metadata.route.workflow) --repo \(repository.nameWithOwner) --ref main")
         }
         Thread.sleep(forTimeInterval: 10)
     }

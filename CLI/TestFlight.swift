@@ -444,12 +444,34 @@ func nextBuildNumber(_ previous: String?) throws -> String {
     return next.map(String.init).joined(separator: ".")
 }
 
-func newDelivery(fingerprint: String, appID: String, bundle: String, cache: URL, client: AppStoreClient) throws -> DeliveryState {
+func nextAppleBuildNumber(appID: String, client: AppStoreClient) throws -> String {
     let response = try client.request("GET", path: "/v1/builds", query: ["filter[app]": appID, "sort": "-uploadedDate", "limit": "1"], body: nil)
     let previous = try JSONDecoder().decode(AppleList.self, from: response).data.first?.string("version")
     let uploads = try client.request("GET", path: "/v1/apps/\(appID)/buildUploads", query: ["sort": "-uploadedDate", "limit": "1", "fields[buildUploads]": "cfBundleVersion"], body: nil)
     let previousUpload = try JSONDecoder().decode(AppleList.self, from: uploads).data.first?.string("cfBundleVersion")
     let candidates = try [previous, previousUpload].compactMap { $0 }.map { try nextBuildNumber($0) }
-    let number = candidates.max { $0.compare($1, options: .numeric) == .orderedAscending } ?? "1"
+    return candidates.max { $0.compare($1, options: .numeric) == .orderedAscending } ?? "1"
+}
+
+func newDelivery(fingerprint: String, appID: String, bundle: String, cache: URL, client: AppStoreClient) throws -> DeliveryState {
+    let minimum = try nextAppleBuildNumber(appID: appID, client: client)
+    let number = try reserveBuildNumber(bundle: bundle, minimum: minimum, directory: TestFlightConfiguration.directory.appendingPathComponent("build-numbers"))
     return DeliveryState(fingerprint: fingerprint, appID: appID, bundleIdentifier: bundle, buildNumber: number, archivePath: cache.appendingPathComponent("TestFlight-\(number).xcarchive").path, phase: "created")
+}
+
+func reserveBuildNumber(bundle: String, minimum: String, directory: URL) throws -> String {
+    try validate(bundle, pattern: "^com\\.lucaswkuipers\\.[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)*$", label: "personal bundle identifier")
+    _ = try nextBuildNumber(minimum)
+    try files.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    let descriptor = open(directory.appendingPathComponent("\(bundle).lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+    guard descriptor >= 0 else { throw CommandError(message: "Cannot open build-number lock.") }
+    defer { close(descriptor) }
+    guard flock(descriptor, LOCK_EX) == 0 else { throw CommandError(message: "Cannot acquire build-number lock.") }
+    let state = directory.appendingPathComponent("\(bundle).json")
+    let previous = files.fileExists(atPath: state.path) ? try JSONDecoder().decode(String.self, from: Data(contentsOf: state)) : nil
+    let candidate = try nextBuildNumber(previous)
+    let number = candidate.compare(minimum, options: .numeric) == .orderedDescending ? candidate : minimum
+    try JSONEncoder().encode(number).write(to: state, options: .atomic)
+    try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: state.path)
+    return number
 }

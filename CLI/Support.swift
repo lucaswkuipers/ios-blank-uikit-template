@@ -6,8 +6,24 @@ let files = FileManager.default
 struct Project: Codable {
     let name: String
     let bundleIdentifier: String
+    let delivery: DeliveryRoute?
+
+    var route: DeliveryRoute { delivery ?? .testflight }
 }
 
+enum DeliveryRoute: String, Codable {
+    case testflight
+    case shelf
+
+    var workflow: String { "\(rawValue).yml" }
+
+    var successResult: String {
+        switch self {
+        case .testflight: return "available-to-internal-tester"
+        case .shelf: return "available-in-shelf"
+        }
+    }
+}
 
 struct CommandError: LocalizedError {
     let message: String

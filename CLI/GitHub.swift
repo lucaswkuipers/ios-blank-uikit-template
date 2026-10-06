@@ -97,18 +97,23 @@ func setupAppRepository(directory: String, template: URL) throws -> PersonalRepo
     }
     let repository = try github.repository(name: metadata.name)
     try github.git(root, ["remote", "set-url", "origin", "git@github.com-personal:lucaswkuipers/\(metadata.name).git"], remote: false)
-    let workflow = root.appendingPathComponent(".github/workflows/testflight.yml")
+    let workflowPath = ".github/workflows/\(metadata.route.workflow)"
+    let workflow = root.appendingPathComponent(workflowPath)
     let createdWorkflow = !files.fileExists(atPath: workflow.path)
     if createdWorkflow {
         try files.createDirectory(at: workflow.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try files.copyItem(at: template.appendingPathComponent("CLI/testflight.yml"), to: workflow)
+        let other = metadata.route == .shelf ? "testflight.yml" : "shelf.yml"
+        guard !files.fileExists(atPath: root.appendingPathComponent(".github/workflows/\(other)").path) else {
+            throw CommandError(message: "This app already has another delivery workflow. Migrate its push trigger before adding a second route to avoid duplicate builds.")
+        }
+        try files.copyItem(at: template.appendingPathComponent("CLI/\(metadata.route.workflow)"), to: workflow)
     }
     if (try? github.git(root, ["rev-parse", "--verify", "HEAD"], remote: false)) == nil {
         try github.git(root, ["add", "--all"], remote: false)
         try github.git(root, ["commit", "-m", "Create \(metadata.name) [skip ci]"], remote: false)
     } else if createdWorkflow {
-        try github.git(root, ["add", ".github/workflows/testflight.yml"], remote: false)
-        try github.git(root, ["commit", "--only", ".github/workflows/testflight.yml", "-m", "Enable personal TestFlight delivery [skip ci]"], remote: false)
+        try github.git(root, ["add", workflowPath], remote: false)
+        try github.git(root, ["commit", "--only", workflowPath, "-m", "Enable personal \(metadata.route.rawValue) delivery [skip ci]"], remote: false)
     }
     try github.git(root, ["push", "-u", "origin", "main"], remote: true)
     try installRunner(name: metadata.name, github: github)

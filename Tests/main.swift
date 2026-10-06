@@ -38,6 +38,11 @@ do {
     defer { try? files.removeItem(at: temporary) }
 
     let personal: [String: Any] = ["DEVELOPMENT_TEAM": "AR7T5G5Z83", "PRODUCT_BUNDLE_IDENTIFIER": "com.lucaswkuipers.Test", "CODE_SIGN_STYLE": "Automatic"]
+    let legacyProject = try JSONDecoder().decode(Project.self, from: Data(#"{"name":"Test","bundleIdentifier":"com.lucaswkuipers.Test"}"#.utf8))
+    try expect(legacyProject.route == .testflight, "Existing apps retain their verified delivery route")
+    let shelfProject = try JSONDecoder().decode(Project.self, from: Data(#"{"name":"Test","bundleIdentifier":"com.lucaswkuipers.Test","delivery":"shelf"}"#.utf8))
+    try expect(shelfProject.route == .shelf && shelfProject.route.successResult == "available-in-shelf", "Shelf delivery must wait for its own availability result")
+    try expectFailure { _ = try JSONDecoder().decode(Project.self, from: Data(#"{"name":"Test","bundleIdentifier":"com.lucaswkuipers.Test","delivery":"unknown"}"#.utf8)) }
     try verifyPersonalSettings(personal, expectedBundle: "com.lucaswkuipers.Test")
     var otherTeam = personal
     otherTeam["DEVELOPMENT_TEAM"] = "OTHERTEAM1"
@@ -81,6 +86,20 @@ do {
     try expect(try nextBuildNumber("9999.98.99") == "9999.99.0", "Build number rollover")
     try expectFailure { _ = try nextBuildNumber("9999.99.99") }
     try expectFailure { _ = try nextBuildNumber("1.bad.3") }
+
+    let counters = temporary.appendingPathComponent("delivery")
+    let firstDirect = try ShelfDeliveryState.reserve(bundle: "com.lucaswkuipers.Test", commit: "first", minimum: "4", directory: counters)
+    let retriedDirect = try ShelfDeliveryState.reserve(bundle: "com.lucaswkuipers.Test", commit: "first", minimum: "4", directory: counters)
+    try expect(firstDirect.build == "4" && retriedDirect.build == "4", "Direct retries must retain their reserved build")
+    let flightAfterDirect = try reserveBuildNumber(bundle: "com.lucaswkuipers.Test", minimum: "4", directory: counters.appendingPathComponent("build-numbers"))
+    try expect(flightAfterDirect == "5", "TestFlight must advance past the last direct build")
+    let directAfterFlight = try ShelfDeliveryState.reserve(bundle: "com.lucaswkuipers.Test", commit: "second", minimum: "5", directory: counters)
+    try expect(directAfterFlight.build == "6", "Direct delivery must advance past a reserved TestFlight build")
+    let renewedDirect = try ShelfDeliveryState.reserve(bundle: "com.lucaswkuipers.Test", commit: "second", minimum: "7", directory: counters)
+    try expect(renewedDirect.build == "7", "Re-signing the same commit must be able to advance past the expired published build")
+    try expectFailure { _ = try reserveBuildNumber(bundle: "../escape", minimum: "1", directory: counters) }
+    try "corrupted".write(to: counters.appendingPathComponent("build-numbers/com.lucaswkuipers.Test.json"), atomically: true, encoding: .utf8)
+    try expectFailure { _ = try reserveBuildNumber(bundle: "com.lucaswkuipers.Test", minimum: "1", directory: counters.appendingPathComponent("build-numbers")) }
 
     let uploads = Data(#"{"data":[{"attributes":{"cfBundleVersion":"1","state":{"state":"COMPLETE","errors":[]}}},{"attributes":{"cfBundleVersion":"2","state":{"state":"PROCESSING","errors":[]}}},{"attributes":{"cfBundleVersion":"3","state":{"state":"FAILED","errors":[{"code":"ITMS-TEST","description":"Invalid binary"}]}}}]}"#.utf8)
     try expect(try buildUploadStatus(uploads, buildNumber: "2")?.state == "PROCESSING", "Read the requested upload while the build is not yet visible")

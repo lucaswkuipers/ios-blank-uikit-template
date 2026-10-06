@@ -34,6 +34,9 @@ func create(name: String, options: Options) throws {
         throw CommandError(message: "Provide --bundle-id or set bundlePrefix in \(configurationURL.path)")
     }
     let deploymentTarget = try options.values["--deployment-target"] ?? run("/usr/bin/xcrun", ["--sdk", "iphoneos", "--show-sdk-version"], log: nil)
+    guard let delivery = DeliveryRoute(rawValue: options.values["--delivery"] ?? configuration["delivery"] ?? "testflight") else {
+        throw CommandError(message: "Delivery must be shelf or testflight.")
+    }
     try validate(team, pattern: "^[A-Z0-9]{10}$", label: "team")
     try validate(bundleIdentifier, pattern: "^[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)+$", label: "bundle identifier")
     try validate(deploymentTarget, pattern: "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$", label: "deployment target")
@@ -73,7 +76,7 @@ func create(name: String, options: Options) throws {
     """
     try scheme.write(to: schemes.appendingPathComponent("\(name).xcscheme"), atomically: true, encoding: .utf8)
     try files.copyItem(at: repository.appendingPathComponent(".gitignore"), to: staging.appendingPathComponent(".gitignore"))
-    let metadata = Project(name: name, bundleIdentifier: bundleIdentifier)
+    let metadata = Project(name: name, bundleIdentifier: bundleIdentifier, delivery: delivery)
     try JSONEncoder().encode(metadata).write(to: staging.appendingPathComponent(".uikit-app.json"))
     let iconOutput = staging.appendingPathComponent(".icon-export")
     let installedIconStudio = files.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/iconstudio").path
@@ -160,7 +163,7 @@ do {
     if arguments.isEmpty || arguments == ["--help"] || arguments == ["help"] {
         print("""
         uikit-app create <Name> --icon <purpose-or-symbol> --output <new-directory>
-          [--team <ID>] [--bundle-id <ID>] [--deployment-target <version>] [--local-only]
+          [--team <ID>] [--bundle-id <ID>] [--deployment-target <version>] [--delivery shelf|testflight] [--local-only]
         uikit-app setup-repo <project-directory>
         uikit-app publish <project-directory>
         uikit-app check <project-directory> [--simulator <UDID>]
@@ -176,7 +179,8 @@ do {
         Creates from the programmatic UIKit template and integrates an Icon Studio icon.
         create also creates a private lucaswkuipers repository and installs its Mac CI runner.
         --local-only skips GitHub and CI setup. setup-repo resumes or adds that setup later.
-        Commit app features, then publish pushes main and waits for its TestFlight workflow.
+        Commit app features, then publish pushes main and waits for the app's selected delivery workflow.
+        --delivery shelf opts into the experimental direct route; TestFlight remains the default.
         Every subsequent push to main triggers delivery automatically while the Mac is available.
         check builds and launches in a simulator, captures a screenshot, and restores a simulator
         it booted to shutdown. Logs stay in Library/Caches.
@@ -217,7 +221,7 @@ do {
             _ = try Options(arguments.dropFirst(2), allowed: [])
             try publish(directory: arguments[1])
         case "create":
-            try create(name: arguments[1], options: Options(arguments.dropFirst(2), allowed: ["--icon", "--output", "--team", "--bundle-id", "--deployment-target", "--local-only"]))
+            try create(name: arguments[1], options: Options(arguments.dropFirst(2), allowed: ["--icon", "--output", "--team", "--bundle-id", "--deployment-target", "--delivery", "--local-only"]))
         case "check":
             try check(directory: arguments[1], options: Options(arguments.dropFirst(2), allowed: ["--simulator"]))
         default:

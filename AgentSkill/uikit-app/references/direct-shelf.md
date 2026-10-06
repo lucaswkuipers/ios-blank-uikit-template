@@ -14,11 +14,15 @@ uikit-app setup-shelf-refresh
 uikit-app refresh-shelf
 ```
 
+For an explicit pilot, `create ... --delivery shelf` installs the shelf push workflow and saves that choice in `.uikit-app.json`; the same `publish` command waits for its `available-in-shelf` result. Existing projects without a delivery field keep TestFlight. The machine-wide `delivery` setting can change the default for future apps after device validation; it has not been changed yet. Do not leave two push-triggered delivery workflows in one app.
+
 `setup-direct` verifies the personal Apple account, registers only the selected device if needed, and creates/imports a personal Distribution identity. The first use can require Lucas to approve a macOS Keychain prompt. No password belongs in chat or a repository.
 
 `package` builds one signed Release archive, exports with a personal Ad Hoc profile containing exactly the configured iPhone, then verifies the exported IPA's signature, bundle/build identity, profile, and expiry. Signing configuration lives in `~/.config/uikit-app/direct.json`; private signing material never belongs in Git.
 
 `direct` requires a private personal source repo and committed files, uploads an immutable app release, checks GitHub's size and SHA256, and updates the catalog only for the current main commit. Draft uploads are recoverable. It returns `available-in-shelf`, which means catalog availability, not physical installation.
+
+Both delivery routes reserve build numbers in `~/.config/uikit-app/build-numbers`; direct retries retain their reservation in `direct-deliveries`. This prevents a TestFlight fallback from reusing a newer direct build's version. Preserve these files alongside local credentials when moving to another Mac.
 
 The `catalog` release body contains schema 1 JSON. App releases contain signed IPA files and metadata. Catalog manifest assets contain temporary GitHub package URLs, never a PAT. The shelf resolves a temporary manifest URL with its read-only credential, validates it, then opens `itms-services`. Authorization is never forwarded to GitHub's asset host or the iOS installer.
 
