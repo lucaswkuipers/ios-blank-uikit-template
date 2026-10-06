@@ -43,6 +43,15 @@ do {
     let shelfProject = try JSONDecoder().decode(Project.self, from: Data(#"{"name":"Test","bundleIdentifier":"com.lucaswkuipers.Test","delivery":"shelf"}"#.utf8))
     try expect(shelfProject.route == .shelf && shelfProject.route.successResult == "available-in-shelf", "Shelf delivery must wait for its own availability result")
     try expectFailure { _ = try JSONDecoder().decode(Project.self, from: Data(#"{"name":"Test","bundleIdentifier":"com.lucaswkuipers.Test","delivery":"unknown"}"#.utf8)) }
+    try expect(skipsPushWorkflow("Scaffold [skip ci]"), "Publishing a scaffold must dispatch the skipped workflow")
+    try expect(skipsPushWorkflow("Notes\n\n[SKIP ACTIONS]"), "Skip markers can be in the commit body")
+    try expect(!skipsPushWorkflow("Implement counter"), "Ordinary commits must wait for their push workflow")
+    let delivered = #"{"app":"Test","build":"5","result":"available-in-shelf","sourcesChanged":"false","team":"AR7T5G5Z83"}"#
+    try expect(deliveryResult(logs: "log prefix \(delivered)", project: shelfProject)?["build"] == "5", "Read the matching app's delivery result")
+    try expect(deliveryResult(logs: delivered.replacingOccurrences(of: "\"Test\"", with: "\"Other\""), project: shelfProject) == nil, "Another app's successful delivery cannot satisfy this publish")
+    try expect(deliveryResult(logs: delivered.replacingOccurrences(of: "\"5\"", with: "\"invalid\""), project: shelfProject) == nil, "Malformed build identity must not report successful delivery")
+    try expect(deliveryResult(logs: delivered.replacingOccurrences(of: "\"5\"", with: "\"9999.99.99\""), project: shelfProject) != nil, "The final valid build does not need another available build number")
+    try expect(deliveryResult(logs: delivered, project: legacyProject) == nil, "Another route's success cannot satisfy this publish")
     try verifyPersonalSettings(personal, expectedBundle: "com.lucaswkuipers.Test")
     var otherTeam = personal
     otherTeam["DEVELOPMENT_TEAM"] = "OTHERTEAM1"

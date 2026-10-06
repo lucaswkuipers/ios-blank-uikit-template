@@ -100,10 +100,38 @@ struct DeliveryRun: Decodable {
     let url: String
 }
 
+func skipsPushWorkflow(_ message: String) -> Bool {
+    ["[skip ci]", "[ci skip]", "[no ci]", "[skip actions]", "[actions skip]"].contains { message.lowercased().contains($0) }
+}
+
+func deliveryResult(logs: String, project: Project) -> [String: String]? {
+    for line in logs.split(separator: "\n").reversed() {
+        guard let start = line.firstIndex(of: "{"),
+              let result = try? JSONDecoder().decode([String: String].self, from: Data(line[start...].utf8)),
+              result["result"] == project.route.successResult, result["sourcesChanged"] == "false",
+              result["team"] == TestFlightConfiguration.personalTeam, result["app"] == project.name,
+              let build = result["build"], build.range(of: "^[0-9]{1,4}(?:\\.[0-9]{1,2}){0,2}$", options: .regularExpression) != nil else {
+            continue
+        }
+        return result
+    }
+    return nil
+}
+
 func publish(directory: String) throws {
     let root = URL(fileURLWithPath: directory).standardizedFileURL.resolvingSymlinksInPath()
     let metadata = try JSONDecoder().decode(Project.self, from: Data(contentsOf: root.appendingPathComponent(".uikit-app.json")))
     try validate(metadata.name, pattern: "^[A-Za-z][A-Za-z0-9]*$", label: "project name")
+    let locks = TestFlightConfiguration.directory.appendingPathComponent("locks")
+    try files.createDirectory(at: locks, withIntermediateDirectories: true)
+    let descriptor = open(locks.appendingPathComponent("publish-\(metadata.name).lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+    guard descriptor >= 0 else {
+        throw CommandError(message: "Cannot open publish lock.")
+    }
+    defer { close(descriptor) }
+    guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+        throw CommandError(message: "Another publish command is already waiting for this app. Follow that command instead of starting another delivery.")
+    }
     let github = try PersonalGitHub()
     let repository = try github.repository(name: metadata.name)
     try verifyPersonalRemote(github.git(root, ["remote", "get-url", "origin"], remote: false), name: metadata.name)
@@ -112,11 +140,13 @@ func publish(directory: String) throws {
         throw CommandError(message: "Review and commit the app changes on main before publishing.")
     }
     let commit = try github.git(root, ["rev-parse", "HEAD"], remote: false)
+    let skippedPush = skipsPushWorkflow(try github.git(root, ["log", "-1", "--format=%B"], remote: false))
     try github.git(root, ["remote", "set-url", "origin", "git@github.com-personal:lucaswkuipers/\(metadata.name).git"], remote: false)
     try github.git(root, ["push", "origin", "main"], remote: true)
     status("Waiting for GitHub's \(metadata.route.rawValue) delivery of \(commit.prefix(7))…")
     let deadline = Date().addingTimeInterval(3000)
-    let registrationDeadline = Date().addingTimeInterval(90)
+    var registrationDeadline = Date().addingTimeInterval(skippedPush ? 0 : 90)
+    var dispatched = false
     var previousStatus = ""
     while Date() < deadline {
         let output = try github.call(["run", "list", "--repo", repository.nameWithOwner, "--workflow", metadata.route.workflow, "--commit", commit, "--json", "databaseId,status,conclusion,url", "--limit", "1"])
@@ -131,20 +161,24 @@ func publish(directory: String) throws {
                     throw CommandError(message: "Delivery workflow finished with \(delivery.conclusion): \(delivery.url). Fix or rerun this workflow; the CLI retains resumable delivery state.")
                 }
                 let logs = try github.call(["run", "view", String(delivery.databaseId), "--repo", repository.nameWithOwner, "--log"])
-                for line in logs.split(separator: "\n").reversed() {
-                    guard let start = line.firstIndex(of: "{"),
-                          let result = try? JSONDecoder().decode([String: String].self, from: Data(line[start...].utf8)),
-                          result["result"] == metadata.route.successResult, result["sourcesChanged"] == "false",
-                          result["team"] == TestFlightConfiguration.personalTeam else {
-                        continue
-                    }
+                if let result = deliveryResult(logs: logs, project: metadata) {
                     try emit(result.merging(["repository": repository.url, "workflow": delivery.url, "commit": commit], uniquingKeysWith: { _, new in new }))
                     return
                 }
                 throw CommandError(message: "Workflow succeeded but did not confirm personal \(metadata.route.rawValue) availability: \(delivery.url)")
             }
         } else if Date() > registrationDeadline {
-            throw RequiredAction(result: "needs-workflow-run", message: "No delivery run exists for this commit. The starter intentionally skips CI.", command: "gh workflow run \(metadata.route.workflow) --repo \(repository.nameWithOwner) --ref main")
+            guard !dispatched else {
+                throw RequiredAction(result: "delivery-pending", message: "GitHub accepted the workflow dispatch but has not listed it yet. Do not dispatch another run.", command: "uikit-app publish \(root.path)")
+            }
+            let currentMain = try github.call(["api", "repos/\(repository.nameWithOwner)/git/ref/heads/main", "--jq", ".object.sha"])
+            guard currentMain == commit else {
+                throw CommandError(message: "Main advanced while waiting. Publish the current main commit instead of dispatching an older build.")
+            }
+            status("Starting the missing \(metadata.route.rawValue) workflow for this commit…")
+            try github.call(["workflow", "run", metadata.route.workflow, "--repo", repository.nameWithOwner, "--ref", "main"])
+            dispatched = true
+            registrationDeadline = Date().addingTimeInterval(90)
         }
         Thread.sleep(forTimeInterval: 10)
     }

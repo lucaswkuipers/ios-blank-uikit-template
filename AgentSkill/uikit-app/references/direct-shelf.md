@@ -16,6 +16,8 @@ uikit-app refresh-shelf
 
 The machine-wide `delivery: shelf` setting makes `create` install the shelf push workflow and save that choice in `.uikit-app.json`; the same `publish` command waits for its `available-in-shelf` result. `--delivery testflight` overrides the route for a new app. Existing projects without a delivery field keep TestFlight. Do not leave two push-triggered delivery workflows in one app.
 
+An explicit `publish` starts the workflow if the commit skipped CI or no push run appeared within 90 seconds. It checks the remote commit before dispatching and prevents concurrent publish waiters. If GitHub has accepted a dispatch but has not listed it after another 90 seconds, it reports pending; resume with `publish`, without manually dispatching another workflow. A completed publish reuses its existing run. Failed runs still require fixing the reported failure or rerunning that workflow.
+
 `setup-direct` verifies the personal Apple account, registers only the selected device if needed, and creates/imports a personal Distribution identity. The first use can require Lucas to approve a macOS Keychain prompt. No password belongs in chat or a repository.
 
 `package` builds one signed Release archive, exports with a personal Ad Hoc profile containing exactly the configured iPhone, then verifies the exported IPA's signature, bundle/build identity, profile, and expiry. Signing configuration lives in `~/.config/uikit-app/direct.json`; private signing material never belongs in Git.

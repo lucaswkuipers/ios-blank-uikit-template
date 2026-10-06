@@ -32,9 +32,11 @@ Every subsequent push to `main` triggers the route selected during creation. Luc
 
 The CLI verifies the active personal GitHub account, remote ownership, and private visibility before pushing. It pins personal GitHub credentials and uses the personal SSH host. Existing public or other-owner remotes are rejected. Review and commit feature changes before publishing; failed runs link to GitHub logs, and rerunning the workflow resumes saved delivery state. Manual `testflight` remains available for recovery; do not run it in parallel with the same push's workflow.
 
+Explicit `publish` also starts a missing workflow when the commit skipped CI. It checks for an existing run first and verifies that remote main still matches before dispatching. Concurrent publish commands for one app are rejected; follow the original command. Completed publishes reuse their existing workflow and build. Success must match the app name, delivery route, signing team, and unchanged sources.
+
 Each delivery route performs one signed Release archive. Simulator startup is optional: `uikit-app check /path/to/Calories` builds only for the simulator, installs, launches, checks that the process stays alive, and captures a screenshot. It uses a dedicated simulator per project and shuts it down afterward if it was not already booted. Pass `--simulator <UDID>` to choose another. JSON output contains app paths, screenshot, and complete logs under `~/Library/Caches/uikit-app`; startup alone does not prove feature correctness.
 
-`AgentSkill/uikit-app` provides short, automatically discoverable instructions for agents. The generated project remains a normal Xcode project and does not depend on the CLI to build.
+`AgentSkill/uikit-app` provides short, automatically discoverable instructions for agents. New projects also include their own `AGENTS.md` and Claude's `@AGENTS.md` reference; creation returns the exact source directory and selected delivery route. The generated project remains a normal Xcode project and does not depend on the CLI to build.
 
 ## Private AppShelf delivery
 

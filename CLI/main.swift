@@ -78,6 +78,17 @@ func create(name: String, options: Options) throws {
     try files.copyItem(at: repository.appendingPathComponent(".gitignore"), to: staging.appendingPathComponent(".gitignore"))
     let metadata = Project(name: name, bundleIdentifier: bundleIdentifier, delivery: delivery)
     try JSONEncoder().encode(metadata).write(to: staging.appendingPathComponent(".uikit-app.json"))
+    let instructions = """
+    # \(name)
+
+    Programmatic UIKit app; no storyboards or SwiftUI. App files in `\(name)/` join the Xcode target automatically.
+
+    Use the shared `uikit-app` skill. Implement the requested features, commit on main, then run `uikit-app publish <this-directory>`. The CLI pushes and waits for the exact commit's delivery; do not run a duplicate local archive or delivery. The selected route is `\(delivery.rawValue)` in `.uikit-app.json`. `uikit-app check <this-directory>` is optional for simulator verification.
+
+    Automatic delivery is restricted to personal Apple team `AR7T5G5Z83` and private `lucaswkuipers` repositories. Keep credentials and build outputs out of Git. Preserve the generated icon unless replacement is requested. Honor requests to skip delivery. AppShelf availability does not mean installation; iOS requires confirmation. Notifications are currently skipped.
+    """
+    try instructions.write(to: staging.appendingPathComponent("AGENTS.md"), atomically: true, encoding: .utf8)
+    try "@AGENTS.md\n".write(to: staging.appendingPathComponent("CLAUDE.md"), atomically: true, encoding: .utf8)
     let iconOutput = staging.appendingPathComponent(".icon-export")
     let installedIconStudio = files.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/iconstudio").path
     let iconStudio = files.isExecutableFile(atPath: installedIconStudio) ? installedIconStudio : "/Applications/Icon Studio.app/Contents/MacOS/iconstudio"
@@ -87,7 +98,7 @@ func create(name: String, options: Options) throws {
     try files.copyItem(at: iconOutput.appendingPathComponent("AppIcon.appiconset"), to: appIcon)
     try files.removeItem(at: iconOutput)
     try files.moveItem(at: staging, to: destination)
-    var result = ["project": destination.appendingPathComponent("\(name).xcodeproj").path, "bundleIdentifier": bundleIdentifier, "team": team, "deploymentTarget": deploymentTarget]
+    var result = ["project": destination.appendingPathComponent("\(name).xcodeproj").path, "sources": destination.appendingPathComponent(name).path, "bundleIdentifier": bundleIdentifier, "team": team, "deploymentTarget": deploymentTarget, "delivery": delivery.rawValue]
     if !options.localOnly {
         do {
             result["repository"] = try setupAppRepository(directory: destination.path, template: repository).url

@@ -34,9 +34,10 @@ struct PersonalGitHub {
 
     static func verifyActiveAccount(environment: [String: String]) throws {
         let arguments = ["auth", "status", "--hostname", "github.com", "--active", "--json", "hosts", "--jq", ".hosts[\"github.com\"][] | select(.active and .state == \"success\") | .login"]
-        if try run(executable, arguments, log: nil, environment: environment) != "lucaswkuipers" {
-            try run(executable, ["auth", "switch", "--hostname", "github.com", "--user", "lucaswkuipers"], log: nil, environment: environment)
+        if try run(executable, arguments, log: nil, environment: environment) == "lucaswkuipers" {
+            return
         }
+        try run(executable, ["auth", "switch", "--hostname", "github.com", "--user", "lucaswkuipers"], log: nil, environment: environment)
         guard try run(executable, arguments, log: nil, environment: environment) == "lucaswkuipers" else {
             throw CommandError(message: "Personal GitHub login lucaswkuipers is required.")
         }
