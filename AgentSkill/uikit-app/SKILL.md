@@ -35,6 +35,8 @@ This is authorized for Lucas's personal account, team `AR7T5G5Z83`, with only hi
 
 For `needs-app-record`, create the returned iOS app record once at the returned App Store Connect URL, verifying the personal account. Use the supplied name, bundle ID, SKU, English (U.S.), and Limited Access. Then rerun the command. Apple's public API cannot create this record.
 
+For `needs-internal-tester`, open the returned Personal group, choose Invite Testers, and add only the configured personal Account Holder email. Internal tester IDs are app-specific. Then rerun the command; this setup is needed only once per app.
+
 Only `available-to-internal-tester` confirms delivery; it does not prove installation or notification receipt. For `processing`, rerun the same command to resume, without recreating the app or upload. If `sourcesChanged` is true, rerun to deliver the newer source. Use `--retry-upload` only after the upload log shows a failed attempt; it retains the same build number. Account/legal failures need user action. For missing initial configuration, read [setup and recovery](references/testflight-setup.md).
 
 Physical-device installation, external testing, and App Store submission remain separate user requests.

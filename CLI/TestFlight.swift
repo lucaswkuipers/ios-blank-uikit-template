@@ -198,7 +198,7 @@ func verifyPersonalSettings(_ settings: [String: Any], expectedBundle: String) t
     }
 }
 
-func personalGroup(client: AppStoreClient, appID: String) throws -> AppleResource {
+func personalGroup(client: AppStoreClient, appID: String) throws -> AppleResource? {
     let email = client.configuration.testerEmail.lowercased()
     let groups = try client.list("/v1/betaGroups", query: ["filter[app]": appID, "filter[isInternalGroup]": "true"])
     for group in groups where group.bool("hasAccessToAllBuilds") == true || group.string("name") == "Personal" {
@@ -215,11 +215,12 @@ func personalGroup(client: AppStoreClient, appID: String) throws -> AppleResourc
     guard group.bool("isInternalGroup") == true else { throw CommandError(message: "Expected an internal tester group.") }
     let members = try client.list("/v1/betaGroups/\(group.id)/betaTesters", query: [:])
     if !members.contains(where: { $0.string("email")?.lowercased() == email }) {
-        let testers = try client.list("/v1/betaTesters", query: ["filter[email]": client.configuration.testerEmail])
+        let testers = try client.list("/v1/betaTesters", query: ["filter[email]": client.configuration.testerEmail, "filter[apps]": appID])
         if let tester = testers.first {
             try client.request("POST", path: "/v1/betaGroups/\(group.id)/relationships/betaTesters", query: [:], body: ["data": [["type": "betaTesters", "id": tester.id]]])
         } else {
-            _ = try client.create(type: "betaTesters", attributes: ["email": client.configuration.testerEmail], relationships: ["betaGroups": ["data": [["type": "betaGroups", "id": group.id]]]])
+            try emit(["result": "needs-internal-tester", "tester": client.configuration.testerEmail, "group": "Personal", "url": "https://appstoreconnect.apple.com/teams/\(client.configuration.issuer)/apps/\(appID)/testflight/groups/\(group.id)", "team": TestFlightConfiguration.personalTeam])
+            return nil
         }
     }
     let verified = try client.list("/v1/betaGroups/\(group.id)/betaTesters", query: [:])
@@ -243,7 +244,7 @@ func deliverTestFlight(directory: String, options: Options) throws {
     let root = URL(fileURLWithPath: directory).standardizedFileURL
     let metadata = try JSONDecoder().decode(Project.self, from: Data(contentsOf: root.appendingPathComponent(".uikit-app.json")))
     let projectArguments = ["-project", root.appendingPathComponent("\(metadata.name).xcodeproj").path, "-scheme", metadata.name, "-configuration", "Release"]
-    let settingsJSON = try run("/usr/bin/xcodebuild", projectArguments + ["-showBuildSettings", "-json"], log: nil)
+    let settingsJSON = try run("/usr/bin/xcodebuild", projectArguments + ["-destination", "generic/platform=iOS", "-showBuildSettings", "-json"], log: nil)
     guard let targets = try JSONSerialization.jsonObject(with: Data(settingsJSON.utf8)) as? [[String: Any]],
           let target = targets.first(where: { $0["target"] as? String == metadata.name }), let settings = target["buildSettings"] as? [String: Any] else {
         throw CommandError(message: "Cannot read application build settings.")
@@ -265,7 +266,7 @@ func deliverTestFlight(directory: String, options: Options) throws {
         try emit(["result": "needs-app-record", "name": metadata.name, "bundleIdentifier": metadata.bundleIdentifier, "sku": metadata.bundleIdentifier, "platform": "iOS", "primaryLanguage": "English (U.S.)", "url": "https://appstoreconnect.apple.com/apps", "team": TestFlightConfiguration.personalTeam])
         return
     }
-    let group = try personalGroup(client: client, appID: app.id)
+    guard let group = try personalGroup(client: client, appID: app.id) else { return }
     let fingerprint = try sourceFingerprint(root)
     let directoryDigest = SHA256.hash(data: Data(root.path.utf8)).prefix(6).map { String(format: "%02x", $0) }.joined()
     let cache = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/\(metadata.name)-\(directoryDigest)")
@@ -326,7 +327,7 @@ func deliverTestFlight(directory: String, options: Options) throws {
         status("Uploading internal-only build \(state.buildNumber)…")
         state.phase = "upload-started"
         try state.save(stateURL)
-        try run("/usr/bin/xcodebuild", ["-exportArchive", "-archivePath", archive.path, "-exportOptionsPlist", optionsURL.path, "-exportPath", cache.appendingPathComponent("TestFlightExport").path] + authentication, log: cache.appendingPathComponent("testflight-upload.log"))
+        try run("/usr/bin/xcodebuild", ["-exportArchive", "-archivePath", archive.path, "-exportOptionsPlist", optionsURL.path, "-exportPath", cache.appendingPathComponent("TestFlightExport").path, "-allowProvisioningUpdates"], log: cache.appendingPathComponent("testflight-upload.log"))
         state.phase = "uploaded"
         try state.save(stateURL)
     }

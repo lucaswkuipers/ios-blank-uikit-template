@@ -59,6 +59,11 @@ func run(_ executable: String, _ arguments: [String], log: URL?) throws -> Strin
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executable)
     process.arguments = arguments
+    if executable == "/usr/bin/xcodebuild" {
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:" + (environment["PATH"] ?? "")
+        process.environment = environment
+    }
     process.standardOutput = handle
     process.standardError = handle
     try process.run()
