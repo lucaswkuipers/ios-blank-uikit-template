@@ -47,6 +47,22 @@ do {
     try expectFailure { try verifyPersonalSettings(otherBundle, expectedBundle: "co.amo.Test") }
     try expectFailure { try verifyPersonalSettings(personal, expectedBundle: "com.lucaswkuipers.Other") }
 
+    let directProfile: [String: Any] = ["TeamIdentifier": ["AR7T5G5Z83"], "ProvisionedDevices": ["personal-iphone"], "Entitlements": ["application-identifier": "AR7T5G5Z83.com.lucaswkuipers.Test", "get-task-allow": false], "ExpirationDate": Date().addingTimeInterval(86400 * 30)]
+    _ = try verifyDirectProfile(directProfile, bundle: "com.lucaswkuipers.Test", deviceUDID: "personal-iphone")
+    for (key, value) in [("TeamIdentifier", ["OTHERTEAM1"] as Any), ("ProvisionedDevices", ["personal-iphone", "another-device"] as Any), ("ExpirationDate", Date() as Any), ("ProvisionsAllDevices", true as Any), ("Entitlements", ["application-identifier": "AR7T5G5Z83.com.lucaswkuipers.Test", "get-task-allow": true] as Any)] {
+        var invalid = directProfile
+        invalid[key] = value
+        try expectFailure { _ = try verifyDirectProfile(invalid, bundle: "com.lucaswkuipers.Test", deviceUDID: "personal-iphone") }
+    }
+    try expectFailure { _ = try verifyDirectProfile(directProfile, bundle: "com.lucaswkuipers.Other", deviceUDID: "personal-iphone") }
+    try expectFailure { _ = try verifyDirectProfile(directProfile, bundle: "com.lucaswkuipers.Test", deviceUDID: "another-device") }
+
+    let payloadExpiry = try JSONSerialization.data(withJSONObject: ["exp": 1000]).base64EncodedString().replacingOccurrences(of: "=", with: "")
+    let download = URL(string: "https://release-assets.githubusercontent.com/artifact?se=2099-01-01T00:00:00Z&jwt=header.\(payloadExpiry).signature")!
+    try expect(try shelfDownloadExpiration(download) == Date(timeIntervalSince1970: 1000), "GitHub JWT can expire before the blob signature")
+    try expectFailure { _ = try shelfDownloadExpiration(URL(string: "https://evil.invalid/artifact?se=2099-01-01T00:00:00Z&jwt=header.\(payloadExpiry).signature")!) }
+    try expectFailure { _ = try shelfDownloadExpiration(URL(string: "https://release-assets.githubusercontent.com/artifact?se=2099-01-01T00:00:00Z")!) }
+
     try PersonalRepository(nameWithOwner: "lucaswkuipers/Example", isPrivate: true, url: "https://github.com/lucaswkuipers/Example").verify(name: "Example")
     try expectFailure { try PersonalRepository(nameWithOwner: "lucaswkuipers/Example", isPrivate: false, url: "").verify(name: "Example") }
     try expectFailure { try PersonalRepository(nameWithOwner: "wesprint-io/Example", isPrivate: true, url: "").verify(name: "Example") }

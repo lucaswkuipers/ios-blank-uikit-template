@@ -129,7 +129,7 @@ func check(directory: String, options: Options) throws {
         }
     }
     status("Building for the simulator…")
-    try run("/usr/bin/xcodebuild", base + ["-destination", "platform=iOS Simulator,id=\(simulator)", "CODE_SIGNING_ALLOWED=NO"], log: cache.appendingPathComponent("simulator-build.log"))
+    try run("/usr/bin/xcodebuild", base + ["-destination", "platform=iOS Simulator,id=\(simulator)", "CODE_SIGNING_ALLOWED=YES", "CODE_SIGN_IDENTITY=-"], log: cache.appendingPathComponent("simulator-build.log"))
     let simulatorApp = derivedData.appendingPathComponent("Build/Products/Debug-iphonesimulator/\(metadata.name).app")
     status("Launching in simulator \(simulator)…")
     if !wasBooted { try run("/usr/bin/xcrun", ["simctl", "boot", simulator], log: nil) }
@@ -166,6 +166,11 @@ do {
         uikit-app check <project-directory> [--simulator <UDID>]
         uikit-app testflight <project-directory> [--wait-seconds <seconds>] [--retry-upload]
         uikit-app login
+        uikit-app setup-direct --device <iPhone-UDID> --name <device-name>
+        uikit-app package <project-directory> --build <number>
+        uikit-app direct <project-directory>
+        uikit-app refresh-shelf
+        uikit-app setup-shelf-refresh
         uikit-app setup-testflight --key <file.p8> --key-id <ID> --issuer <UUID> --tester <email> --account-bundle <existing-personal-bundle-ID>
 
         Creates from the programmatic UIKit template and integrates an Icon Studio icon.
@@ -183,13 +188,27 @@ do {
         """)
     } else if arguments == ["login"] {
         try login()
+    } else if arguments == ["refresh-shelf"] {
+        try refreshShelf()
+    } else if arguments == ["setup-shelf-refresh"] {
+        try setupShelfRefresh()
     } else {
         guard arguments.count >= 2 else { throw CommandError(message: "Use uikit-app --help") }
         switch arguments[0] {
         case "setup-testflight":
             try setupTestFlight(options: Options(arguments.dropFirst(), allowed: ["--key", "--key-id", "--issuer", "--tester", "--account-bundle"]))
+        case "setup-direct":
+            try setupDirect(options: Options(arguments.dropFirst(), allowed: ["--device", "--name"]))
+        case "package":
+            let options = try Options(arguments.dropFirst(2), allowed: ["--build"])
+            guard let build = options.values["--build"] else { throw CommandError(message: "Provide --build <number>") }
+            let package = try packageDirect(directory: arguments[1], build: build)
+            try emit(["result": "personal-package-ready", "app": package.name, "build": package.build, "path": package.path, "team": TestFlightConfiguration.personalTeam])
         case "testflight":
             try deliverTestFlight(directory: arguments[1], options: Options(arguments.dropFirst(2), allowed: ["--wait-seconds", "--retry-upload"]))
+        case "direct":
+            _ = try Options(arguments.dropFirst(2), allowed: [])
+            try deliverDirect(directory: arguments[1])
         case "setup-repo":
             _ = try Options(arguments.dropFirst(2), allowed: [])
             let github = try setupAppRepository(directory: arguments[1], template: repository)
