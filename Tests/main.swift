@@ -54,6 +54,13 @@ do {
     try expectFailure { _ = try nextBuildNumber("9999.99.99") }
     try expectFailure { _ = try nextBuildNumber("1.bad.3") }
 
+    let uploads = Data(#"{"data":[{"attributes":{"cfBundleVersion":"1","state":{"state":"COMPLETE","errors":[]}}},{"attributes":{"cfBundleVersion":"2","state":{"state":"PROCESSING","errors":[]}}},{"attributes":{"cfBundleVersion":"3","state":{"state":"FAILED","errors":[{"code":"ITMS-TEST","description":"Invalid binary"}]}}}]}"#.utf8)
+    try expect(try buildUploadStatus(uploads, buildNumber: "2")?.state == "PROCESSING", "Read the requested upload while the build is not yet visible")
+    let failedUpload = try buildUploadStatus(uploads, buildNumber: "3")
+    try expect(failedUpload?.state == "FAILED" && failedUpload?.details.contains("Invalid binary") == true, "Preserve early processing failure details")
+    try expect(try buildUploadStatus(uploads, buildNumber: "4") == nil, "Another build's status must not be reused")
+    try expectFailure { _ = try buildUploadStatus(Data(#"{"data":[{"attributes":{"cfBundleVersion":"2","state":null}}]}"#.utf8), buildNumber: "2") }
+
     let key = P256.Signing.PrivateKey()
     let keyPath = temporary.appendingPathComponent("test.p8")
     try key.pemRepresentation.write(to: keyPath, atomically: true, encoding: .utf8)
@@ -134,7 +141,7 @@ do {
     try state.save(stateURL)
     let saved = try JSONDecoder().decode(DeliveryState.self, from: Data(contentsOf: stateURL))
     try expect(saved.phase == "upload-started" && saved.buildNumber == "1", "Interrupted upload must retain its build identity")
-    print("Passed account/provider guards, safe HTTP retries, clean JSON stdout, JWT signing, build numbering, source fingerprints, and resumable state.")
+    print("Passed account/provider guards, safe HTTP retries, clean JSON stdout, JWT signing, build numbering, upload processing, source fingerprints, and resumable state.")
 } catch {
     status(error.localizedDescription)
     exit(1)

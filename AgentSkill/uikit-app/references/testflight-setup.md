@@ -41,6 +41,8 @@ Implementation references:
 
 Logs and resumable state live in `~/Library/Caches/uikit-app/<project>-<path-hash>/`. A bundle-level lock prevents concurrent deliveries from different checkouts. Safe reads retry transient failures; uncertain writes are reconciled before retrying. Source edits during archiving stop before upload. Edits while an earlier build is processing are reported with `sourcesChanged: true` at completion; rerun for the new source.
 
+Delivery also checks Apple's build-upload status before the processed build becomes visible, surfacing early failures instead of waiting indefinitely. Build numbering includes pending or failed uploads to avoid reusing their numbers.
+
 `--wait-seconds 0` checks processing once; normal calls wait up to 30 minutes without agent polling. `processing` means rerun the same command. `--retry-upload` retries an uncertain/failed upload with the same archive/build number after checking Apple first; inspect the upload log before using it. Do not recreate the project, app record, or API key to recover an upload.
 
 Internal tester IDs are app-specific. Never reuse an arbitrary tester ID found by email across the account. Delivery verifies the Personal internal group contains exactly the configured Account Holder and rejects other testers in groups that can automatically receive the build.

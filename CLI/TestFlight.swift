@@ -69,6 +69,26 @@ struct AppleList: Decodable {
 
 struct AppleItem: Decodable { let data: AppleResource }
 
+func buildUploadStatus(_ data: Data, buildNumber: String) throws -> (state: String, details: String)? {
+    guard let response = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let uploads = response["data"] as? [[String: Any]] else {
+        throw CommandError(message: "Cannot read Apple's build upload status.")
+    }
+    for upload in uploads {
+        guard let attributes = upload["attributes"] as? [String: Any],
+              attributes["cfBundleVersion"] as? String == buildNumber else {
+            continue
+        }
+        guard let status = attributes["state"] as? [String: Any], let state = status["state"] as? String else {
+            throw CommandError(message: "Apple returned no processing state for build \(buildNumber).")
+        }
+        let errors = status["errors"] as? [[String: Any]] ?? []
+        let details = errors.isEmpty ? "" : String(decoding: try JSONSerialization.data(withJSONObject: errors, options: [.sortedKeys]), as: UTF8.self)
+        return (state, details)
+    }
+    return nil
+}
+
 struct AppStoreClient {
     let configuration: TestFlightConfiguration
     let key: P256.Signing.PrivateKey
@@ -365,9 +385,23 @@ func deliverTestFlight(directory: String, options: Options) throws {
                 }
             }
             if previousStatus != processing { status("Apple build status: \(processing)"); previousStatus = processing }
-        } else if previousStatus.isEmpty {
-            status("Waiting for Apple to register the uploaded build…")
-            previousStatus = "waiting"
+        } else {
+            let uploads = try client.request("GET", path: "/v1/apps/\(app.id)/buildUploads", query: ["filter[cfBundleVersion]": state.buildNumber, "fields[buildUploads]": "cfBundleVersion,state", "sort": "-uploadedDate", "limit": "1"], body: nil)
+            if let upload = try buildUploadStatus(uploads, buildNumber: state.buildNumber) {
+                if upload.state == "FAILED" {
+                    state.phase = "rejected"
+                    try state.save(stateURL)
+                    throw CommandError(message: "Apple upload FAILED for build \(state.buildNumber). \(upload.details) Inspect https://appstoreconnect.apple.com/apps/\(app.id)/testflight/ios")
+                }
+                let message = "Apple upload status: \(upload.state)"
+                if previousStatus != message {
+                    status(message)
+                    previousStatus = message
+                }
+            } else if previousStatus.isEmpty {
+                status("Waiting for Apple to register the uploaded build…")
+                previousStatus = "waiting"
+            }
         }
         if Date() >= deadline {
             try emit(["result": "processing", "build": state.buildNumber, "phase": state.phase, "logs": cache.path, "resume": "uikit-app testflight \(root.path)"])
@@ -411,6 +445,9 @@ func nextBuildNumber(_ previous: String?) throws -> String {
 func newDelivery(fingerprint: String, appID: String, bundle: String, cache: URL, client: AppStoreClient) throws -> DeliveryState {
     let response = try client.request("GET", path: "/v1/builds", query: ["filter[app]": appID, "sort": "-uploadedDate", "limit": "1"], body: nil)
     let previous = try JSONDecoder().decode(AppleList.self, from: response).data.first?.string("version")
-    let number = try nextBuildNumber(previous)
+    let uploads = try client.request("GET", path: "/v1/apps/\(appID)/buildUploads", query: ["sort": "-uploadedDate", "limit": "1", "fields[buildUploads]": "cfBundleVersion"], body: nil)
+    let previousUpload = try JSONDecoder().decode(AppleList.self, from: uploads).data.first?.string("cfBundleVersion")
+    let candidates = try [previous, previousUpload].compactMap { $0 }.map { try nextBuildNumber($0) }
+    let number = candidates.max { $0.compare($1, options: .numeric) == .orderedAscending } ?? "1"
     return DeliveryState(fingerprint: fingerprint, appID: appID, bundleIdentifier: bundle, buildNumber: number, archivePath: cache.appendingPathComponent("TestFlight-\(number).xcarchive").path, phase: "created")
 }
