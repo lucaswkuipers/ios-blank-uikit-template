@@ -180,7 +180,7 @@ do {
         create also creates a private lucaswkuipers repository and installs its Mac CI runner.
         --local-only skips GitHub and CI setup. setup-repo resumes or adds that setup later.
         Commit app features, then publish pushes main and waits for the app's selected delivery workflow.
-        --delivery shelf opts into the experimental direct route; TestFlight remains the default.
+        create uses the configured delivery route; --delivery shelf|testflight overrides it.
         Every subsequent push to main triggers delivery automatically while the Mac is available.
         check builds and launches in a simulator, captures a screenshot, and restores a simulator
         it booted to shutdown. Logs stay in Library/Caches.
@@ -188,7 +188,7 @@ do {
         uploads, and waits for internal availability. No browser or simulator is required.
         check is optional for simulator/behavior verification; it is not needed before testflight.
         login performs the occasional Apple CLI password/2FA sign-in in Terminal.
-        Personal defaults: ~/.config/uikit-app/config.json (team and bundlePrefix).
+        Personal defaults: ~/.config/uikit-app/config.json (team, bundlePrefix, and delivery).
         """)
     } else if arguments == ["login"] {
         try login()

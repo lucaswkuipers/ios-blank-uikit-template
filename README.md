@@ -12,10 +12,10 @@ uikit-app create Calories --icon calories --output /path/to/new/Calories \
   --team YOURTEAMID --bundle-id com.example.Calories --local-only
 ```
 
-For repeated use, save `team` and `bundlePrefix` in `~/.config/uikit-app/config.json`:
+For repeated use, save `team`, `bundlePrefix`, and the delivery route in `~/.config/uikit-app/config.json`:
 
 ```json
-{"team":"YOURTEAMID","bundlePrefix":"com.example"}
+{"team":"YOURTEAMID","bundlePrefix":"com.example","delivery":"shelf"}
 ```
 
 Then agents only need:
@@ -28,13 +28,19 @@ uikit-app publish /path/to/new/Calories
 
 Creation copies the canonical template, writes a shared Xcode scheme, and integrates an icon with Lucas's Icon Studio preset. It creates a private `lucaswkuipers/<Name>` GitHub repository and installs a repository-specific GitHub Actions runner on this Mac. The first scaffold commit skips CI. Output must be a new directory. The minimum iOS version defaults to the selected SDK; use `--deployment-target` to override it. `--local-only` skips repository/runner setup; `uikit-app setup-repo <directory>` adds or resumes it later.
 
-Every subsequent push to `main` triggers personal internal TestFlight delivery. `publish` pushes committed changes and waits for the exact commit's workflow, checking its delivery result before reporting availability. GitHub queues the latest pending update while another delivery runs; it does not cancel an upload in progress. The Mac must be awake, online, and logged into the user session running the service. The phone can be on another network. Runner configuration and logs live under `~/.local/share/uikit-app/runners/<Name>`; Apple signing credentials stay on the Mac. Each runner is scoped to one private repository; PRs do not trigger delivery.
+Every subsequent push to `main` triggers the route selected during creation. Lucas's Mac defaults to AppShelf; `--delivery testflight` chooses personal internal TestFlight instead. Existing projects retain their saved route, and legacy projects without a route use TestFlight. `publish` pushes committed changes and waits for the exact commit's workflow, checking its delivery result before reporting availability. GitHub queues the latest pending update while another delivery runs; it does not cancel an upload in progress. The Mac must be awake, online, and logged into the user session running the service. The phone can be on another network. Runner configuration and logs live under `~/.local/share/uikit-app/runners/<Name>`; Apple signing credentials stay on the Mac. Each runner is scoped to one private repository; PRs do not trigger delivery.
 
 The CLI verifies the active personal GitHub account, remote ownership, and private visibility before pushing. It pins personal GitHub credentials and uses the personal SSH host. Existing public or other-owner remotes are rejected. Review and commit feature changes before publishing; failed runs link to GitHub logs, and rerunning the workflow resumes saved delivery state. Manual `testflight` remains available for recovery; do not run it in parallel with the same push's workflow.
 
-`testflight` performs the signed Release build and delivery. Simulator startup is optional: `uikit-app check /path/to/Calories` builds only for the simulator, installs, launches, checks that the process stays alive, and captures a screenshot. It uses a dedicated simulator per project and shuts it down afterward if it was not already booted. Pass `--simulator <UDID>` to choose another. JSON output contains app paths, screenshot, and complete logs under `~/Library/Caches/uikit-app`; startup alone does not prove feature correctness.
+Each delivery route performs one signed Release archive. Simulator startup is optional: `uikit-app check /path/to/Calories` builds only for the simulator, installs, launches, checks that the process stays alive, and captures a screenshot. It uses a dedicated simulator per project and shuts it down afterward if it was not already booted. Pass `--simulator <UDID>` to choose another. JSON output contains app paths, screenshot, and complete logs under `~/Library/Caches/uikit-app`; startup alone does not prove feature correctness.
 
 `AgentSkill/uikit-app` provides short, automatically discoverable instructions for agents. The generated project remains a normal Xcode project and does not depend on the CLI to build.
+
+## Private AppShelf delivery
+
+The shelf workflow runs `uikit-app direct <directory>`. It signs an Ad Hoc build for the configured personal iPhone and publishes immutable artifacts to private `lucaswkuipers/AppShelf-builds`. The phone app reads that repository with a separate read-only token, validates a temporary installation manifest, and opens the iOS installer. Lucas confirms installation on the phone. There is no TestFlight processing wait and no paid hosting service.
+
+The Mac's `uikit-app refresh-shelf` LaunchAgent keeps temporary GitHub install links valid. Keep the Mac awake for new installs and updates; already installed apps run independently until their signing expires. `available-in-shelf` means catalog availability, not installation receipt. Phone notifications are intentionally out of scope for now. See [direct shelf setup and recovery](AgentSkill/uikit-app/references/direct-shelf.md).
 
 ## Private TestFlight delivery
 
