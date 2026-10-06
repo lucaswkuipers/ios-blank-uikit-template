@@ -12,6 +12,14 @@ struct TestFlightConfiguration: Codable {
     let testerEmail: String
     let accountBundle: String
 
+    static func load() throws -> Self {
+        let path = directory.appendingPathComponent("testflight.json")
+        guard files.fileExists(atPath: path.path) else {
+            throw RequiredAction(result: "needs-testflight-setup", message: "Personal TestFlight credentials have not been configured.", command: "uikit-app setup-testflight --help")
+        }
+        return try JSONDecoder().decode(Self.self, from: Data(contentsOf: path))
+    }
+
     func validate() throws {
         guard UUID(uuidString: issuer) != nil, keyID.range(of: "^[A-Z0-9]{10}$", options: .regularExpression) != nil,
               testerEmail.contains("@"), !testerEmail.lowercased().hasSuffix("@amo.co"),
@@ -92,21 +100,7 @@ struct AppStoreClient {
         request.setValue("Bearer \(try token())", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let body { request.httpBody = try JSONSerialization.data(withJSONObject: body) }
-        let completion = DispatchSemaphore(value: 0)
-        var result: Result<Data, Error>!
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            defer { completion.signal() }
-            if let error { result = .failure(error); return }
-            guard let response = response as? HTTPURLResponse, let data else {
-                result = .failure(CommandError(message: "App Store Connect returned no response.")); return
-            }
-            guard (200..<300).contains(response.statusCode) else {
-                result = .failure(CommandError(message: "App Store Connect \(method) \(path): HTTP \(response.statusCode)\n\(String(decoding: data, as: UTF8.self).prefix(1800))")); return
-            }
-            result = .success(data)
-        }.resume()
-        completion.wait()
-        return try result.get()
+        return try appleRequest(request)
     }
 
     func list(_ path: String, query: [String: String]) throws -> [AppleResource] {
@@ -173,14 +167,20 @@ struct DeliveryState: Codable {
 }
 
 func sourceFingerprint(_ root: URL) throws -> String {
-    guard let enumerator = files.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) else {
+    var enumerationError: Error?
+    guard let enumerator = files.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [], errorHandler: { _, error in
+        enumerationError = error
+        return false
+    }) else {
         throw CommandError(message: "Cannot enumerate project sources.")
     }
     var paths: [URL] = []
     for case let url as URL in enumerator {
-        if ["xcuserdata", "build", "DerivedData"].contains(url.lastPathComponent) { enumerator.skipDescendants(); continue }
+        if [".git", ".build", ".DS_Store", "xcuserdata", "build", "DerivedData"].contains(url.lastPathComponent) { enumerator.skipDescendants(); continue }
         if try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true { paths.append(url) }
     }
+    if let enumerationError { throw enumerationError }
+    guard !paths.isEmpty else { throw CommandError(message: "Project contains no readable source files. Delivery stopped.") }
     var hash = SHA256()
     for url in paths.sorted(by: { $0.path < $1.path }) {
         hash.update(data: Data(url.path.dropFirst(root.path.count).utf8))
@@ -198,7 +198,7 @@ func verifyPersonalSettings(_ settings: [String: Any], expectedBundle: String) t
     }
 }
 
-func personalGroup(client: AppStoreClient, appID: String) throws -> AppleResource? {
+func personalGroup(client: AppStoreClient, appID: String, web: () throws -> AppleWebSession) throws -> AppleResource {
     let email = client.configuration.testerEmail.lowercased()
     let groups = try client.list("/v1/betaGroups", query: ["filter[app]": appID, "filter[isInternalGroup]": "true"])
     for group in groups where group.bool("hasAccessToAllBuilds") == true || group.string("name") == "Personal" {
@@ -219,8 +219,13 @@ func personalGroup(client: AppStoreClient, appID: String) throws -> AppleResourc
         if let tester = testers.first {
             try client.request("POST", path: "/v1/betaGroups/\(group.id)/relationships/betaTesters", query: [:], body: ["data": [["type": "betaTesters", "id": tester.id]]])
         } else {
-            try emit(["result": "needs-internal-tester", "tester": client.configuration.testerEmail, "group": "Personal", "url": "https://appstoreconnect.apple.com/teams/\(client.configuration.issuer)/apps/\(appID)/testflight/groups/\(group.id)", "team": TestFlightConfiguration.personalTeam])
-            return nil
+            status("Adding the personal Account Holder to internal testing…")
+            let session = try web()
+            do { try session.addInternalTester(groupID: group.id) }
+            catch {
+                let reconciled = try client.list("/v1/betaGroups/\(group.id)/betaTesters", query: [:])
+                guard reconciled.contains(where: { $0.string("email")?.lowercased() == email }) else { throw error }
+            }
         }
     }
     let verified = try client.list("/v1/betaGroups/\(group.id)/betaTesters", query: [:])
@@ -234,17 +239,27 @@ func deliverTestFlight(directory: String, options: Options) throws {
     guard let seconds = Int(options.values["--wait-seconds"] ?? "1800"), (0...3600).contains(seconds) else {
         throw CommandError(message: "--wait-seconds must be between 0 and 3600.")
     }
-    let configurationURL = TestFlightConfiguration.directory.appendingPathComponent("testflight.json")
-    guard files.fileExists(atPath: configurationURL.path) else {
-        throw CommandError(message: "Personal TestFlight setup is required. Run uikit-app setup-testflight; see uikit-app --help.")
-    }
-    let configuration = try JSONDecoder().decode(TestFlightConfiguration.self, from: Data(contentsOf: configurationURL))
+    let configuration = try TestFlightConfiguration.load()
     let client = try AppStoreClient(configuration: configuration)
     try client.verifyPersonalAccount()
-    let root = URL(fileURLWithPath: directory).standardizedFileURL
+    let root = URL(fileURLWithPath: directory).standardizedFileURL.resolvingSymlinksInPath()
     let metadata = try JSONDecoder().decode(Project.self, from: Data(contentsOf: root.appendingPathComponent(".uikit-app.json")))
+    try validate(metadata.name, pattern: "^[A-Za-z][A-Za-z0-9]*$", label: "project name")
+    try validate(metadata.bundleIdentifier, pattern: "^[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)+$", label: "bundle identifier")
+    let lockDirectory = TestFlightConfiguration.directory.appendingPathComponent("locks")
+    try files.createDirectory(at: lockDirectory, withIntermediateDirectories: true)
+    let lockURL = lockDirectory.appendingPathComponent("\(metadata.bundleIdentifier).lock")
+    let descriptor = open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+    guard descriptor >= 0 else { throw CommandError(message: "Cannot open delivery lock.") }
+    defer { close(descriptor) }
+    guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+        throw CommandError(message: "Another delivery is already running for this app.")
+    }
+    let directoryDigest = SHA256.hash(data: Data(root.path.utf8)).prefix(6).map { String(format: "%02x", $0) }.joined()
+    let cache = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/\(metadata.name)-\(directoryDigest)")
+    try files.createDirectory(at: cache, withIntermediateDirectories: true)
     let projectArguments = ["-project", root.appendingPathComponent("\(metadata.name).xcodeproj").path, "-scheme", metadata.name, "-configuration", "Release"]
-    let settingsJSON = try run("/usr/bin/xcodebuild", projectArguments + ["-destination", "generic/platform=iOS", "-showBuildSettings", "-json"], log: nil)
+    let settingsJSON = try run("/usr/bin/xcodebuild", projectArguments + ["-destination", "generic/platform=iOS", "-showBuildSettings", "-json"], log: nil, separateError: true)
     guard let targets = try JSONSerialization.jsonObject(with: Data(settingsJSON.utf8)) as? [[String: Any]],
           let target = targets.first(where: { $0["target"] as? String == metadata.name }), let settings = target["buildSettings"] as? [String: Any] else {
         throw CommandError(message: "Cannot read application build settings.")
@@ -261,23 +276,16 @@ func deliverTestFlight(directory: String, options: Options) throws {
     } else if bundles[0].string("seedId") != TestFlightConfiguration.personalTeam {
         throw CommandError(message: "Bundle ID belongs to a different team.")
     }
-    let apps = try client.list("/v1/apps", query: ["filter[bundleId]": metadata.bundleIdentifier])
-    guard let app = apps.first else {
-        try emit(["result": "needs-app-record", "name": metadata.name, "bundleIdentifier": metadata.bundleIdentifier, "sku": metadata.bundleIdentifier, "platform": "iOS", "primaryLanguage": "English (U.S.)", "url": "https://appstoreconnect.apple.com/apps", "team": TestFlightConfiguration.personalTeam])
-        return
+    var webSession: AppleWebSession?
+    func web() throws -> AppleWebSession {
+        if let webSession { return webSession }
+        let session = try AppleWebSession(configuration: configuration)
+        webSession = session
+        return session
     }
-    guard let group = try personalGroup(client: client, appID: app.id) else { return }
+    let app = try registeredApp(metadata: metadata, version: settings["MARKETING_VERSION"] as? String ?? "1.0", client: client, web: web)
+    let group = try personalGroup(client: client, appID: app.id, web: web)
     let fingerprint = try sourceFingerprint(root)
-    let directoryDigest = SHA256.hash(data: Data(root.path.utf8)).prefix(6).map { String(format: "%02x", $0) }.joined()
-    let cache = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/\(metadata.name)-\(directoryDigest)")
-    try files.createDirectory(at: cache, withIntermediateDirectories: true)
-    let lock = cache.appendingPathComponent("testflight.lock")
-    let descriptor = open(lock.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
-    guard descriptor >= 0 else { throw CommandError(message: "Cannot open delivery lock: \(lock.path)") }
-    defer { close(descriptor) }
-    guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
-        throw CommandError(message: "Another delivery is already running for this project.")
-    }
     let stateURL = cache.appendingPathComponent("testflight-state.json")
     var state: DeliveryState
     if files.fileExists(atPath: stateURL.path) {
@@ -300,17 +308,8 @@ func deliverTestFlight(directory: String, options: Options) throws {
         if files.fileExists(atPath: archive.path) { try files.removeItem(at: archive) }
         status("Archiving build \(state.buildNumber) for personal TestFlight…")
         try run("/usr/bin/xcodebuild", projectArguments + ["-destination", "generic/platform=iOS", "-derivedDataPath", cache.appendingPathComponent("DerivedData").path, "-archivePath", archive.path, "-quiet", "archive", "CURRENT_PROJECT_VERSION=\(state.buildNumber)", "DEVELOPMENT_TEAM=\(TestFlightConfiguration.personalTeam)"] + authentication, log: cache.appendingPathComponent("testflight-archive.log"))
-        let application = archive.appendingPathComponent("Products/Applications/\(metadata.name).app")
-        try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", application.path], log: nil)
-        let signature = try run("/usr/bin/codesign", ["-dvv", application.path], log: nil)
-        guard signature.split(separator: "\n").contains("TeamIdentifier=\(TestFlightConfiguration.personalTeam)") else {
-            throw CommandError(message: "Archive signature is not from the personal team.")
-        }
-        let information = try PropertyListSerialization.propertyList(from: Data(contentsOf: application.appendingPathComponent("Info.plist")), format: nil) as? [String: Any]
-        guard information?["CFBundleIdentifier"] as? String == metadata.bundleIdentifier,
-              information?["CFBundleVersion"] as? String == state.buildNumber,
-              information?["ITSAppUsesNonExemptEncryption"] is Bool else {
-            throw CommandError(message: "Archive identity/version mismatch or missing ITSAppUsesNonExemptEncryption declaration. Determine the app's actual encryption use before uploading.")
+        guard try sourceFingerprint(root) == fingerprint else {
+            throw RequiredAction(result: "sources-changed-during-build", message: "Sources changed while archiving. Rerun after edits finish; this archive was not uploaded.", command: "uikit-app testflight \(root.path)")
         }
         state.phase = "archived"
         try state.save(stateURL)
@@ -321,6 +320,7 @@ func deliverTestFlight(directory: String, options: Options) throws {
         try state.save(stateURL)
     }
     if state.phase == "archived" {
+        try verifyArchive(archive: archive, metadata: metadata, buildNumber: state.buildNumber)
         let exportOptions: [String: Any] = ["method": "app-store-connect", "destination": "upload", "signingStyle": "automatic", "teamID": TestFlightConfiguration.personalTeam, "testFlightInternalTestingOnly": true, "manageAppVersionAndBuildNumber": false, "uploadSymbols": true]
         let optionsURL = cache.appendingPathComponent("TestFlightExportOptions.plist")
         try PropertyListSerialization.data(fromPropertyList: exportOptions, format: .xml, options: 0).write(to: optionsURL, options: .atomic)
@@ -360,7 +360,7 @@ func deliverTestFlight(directory: String, options: Options) throws {
                     guard verified.contains(where: { $0.id == build.id }) else { throw CommandError(message: "Build assignment was not confirmed.") }
                     state.phase = "delivered"
                     try state.save(stateURL)
-                    try emit(["result": "available-to-internal-tester", "sourcesChanged": String(state.fingerprint != fingerprint), "app": metadata.name, "build": state.buildNumber, "team": TestFlightConfiguration.personalTeam, "tester": configuration.testerEmail, "testflight": "https://appstoreconnect.apple.com/apps/\(app.id)/testflight/ios", "logs": cache.path])
+                    try emit(["result": "available-to-internal-tester", "sourcesChanged": String(state.fingerprint != sourceFingerprint(root)), "app": metadata.name, "build": state.buildNumber, "team": TestFlightConfiguration.personalTeam, "tester": configuration.testerEmail, "testflight": "https://appstoreconnect.apple.com/teams/\(configuration.issuer)/apps/\(app.id)/testflight/groups/\(group.id)", "logs": cache.path])
                     return
                 }
             }
@@ -373,7 +373,23 @@ func deliverTestFlight(directory: String, options: Options) throws {
             try emit(["result": "processing", "build": state.buildNumber, "phase": state.phase, "logs": cache.path, "resume": "uikit-app testflight \(root.path)"])
             return
         }
-        Thread.sleep(forTimeInterval: max(0, min(30, deadline.timeIntervalSinceNow)))
+        Thread.sleep(forTimeInterval: max(0, min(10, deadline.timeIntervalSinceNow)))
+    }
+}
+
+func verifyArchive(archive: URL, metadata: Project, buildNumber: String) throws {
+    let application = archive.appendingPathComponent("Products/Applications/\(metadata.name).app")
+    try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", application.path], log: nil)
+    let signature = try run("/usr/bin/codesign", ["-dvv", application.path], log: nil)
+    guard signature.split(separator: "\n").contains("TeamIdentifier=\(TestFlightConfiguration.personalTeam)") else {
+        throw CommandError(message: "Archive signature is not from the personal team.")
+    }
+    let information = try PropertyListSerialization.propertyList(from: Data(contentsOf: application.appendingPathComponent("Info.plist")), format: nil) as? [String: Any]
+    guard information?["CFBundleIdentifier"] as? String == metadata.bundleIdentifier,
+          information?["CFBundleVersion"] as? String == buildNumber,
+          information?["ITSAppUsesNonExemptEncryption"] is Bool,
+          files.fileExists(atPath: application.appendingPathComponent("embedded.mobileprovision").path) else {
+        throw CommandError(message: "Archive identity/version mismatch, missing provisioning, or missing ITSAppUsesNonExemptEncryption. Declare the app's actual encryption use before uploading.")
     }
 }
 

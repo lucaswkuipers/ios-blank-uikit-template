@@ -95,15 +95,6 @@ func check(directory: String, options: Options) throws {
     try files.createDirectory(at: cache, withIntermediateDirectories: true)
     let derivedData = cache.appendingPathComponent("DerivedData")
     let base = ["-project", root.appendingPathComponent("\(metadata.name).xcodeproj").path, "-scheme", metadata.name, "-configuration", "Debug", "-derivedDataPath", derivedData.path, "-quiet", "build"]
-    status("Building and signing for iOS…")
-    var deviceArguments = base + ["-destination", "generic/platform=iOS"]
-    if options.provisioningUpdates { deviceArguments.append("-allowProvisioningUpdates") }
-    try run("/usr/bin/xcodebuild", deviceArguments, log: cache.appendingPathComponent("device-build.log"))
-    let deviceApp = derivedData.appendingPathComponent("Build/Products/Debug-iphoneos/\(metadata.name).app")
-    try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", deviceApp.path], log: nil)
-    guard files.fileExists(atPath: deviceApp.appendingPathComponent("embedded.mobileprovision").path) else {
-        throw CommandError(message: "Device build has no embedded provisioning profile: \(deviceApp.path)")
-    }
     let devicesText = try run("/usr/bin/xcrun", ["simctl", "list", "devices", "available", "--json"], log: nil)
     let devices = try JSONDecoder().decode(SimulatorList.self, from: Data(devicesText.utf8)).devices
     let simulator: String
@@ -153,7 +144,7 @@ func check(directory: String, options: Options) throws {
     }
     let screenshot = cache.appendingPathComponent("simulator.png")
     try run("/usr/bin/xcrun", ["simctl", "io", simulator, "screenshot", screenshot.path], log: nil)
-    try emit(["signedDeviceApp": deviceApp.path, "simulatorApp": simulatorApp.path, "simulator": simulator, "screenshot": screenshot.path, "logs": cache.path, "result": "signed-device-build-and-simulator-launch-passed"])
+    try emit(["simulatorApp": simulatorApp.path, "simulator": simulator, "screenshot": screenshot.path, "logs": cache.path, "result": "simulator-launch-passed"])
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())
@@ -162,17 +153,22 @@ do {
         print("""
         uikit-app create <Name> --icon <purpose-or-symbol> --output <new-directory>
           [--team <ID>] [--bundle-id <ID>] [--deployment-target <version>]
-        uikit-app check <project-directory> [--simulator <UDID>] [--allow-provisioning-updates]
+        uikit-app check <project-directory> [--simulator <UDID>]
         uikit-app testflight <project-directory> [--wait-seconds <seconds>] [--retry-upload]
+        uikit-app login
         uikit-app setup-testflight --key <file.p8> --key-id <ID> --issuer <UUID> --tester <email> --account-bundle <existing-personal-bundle-ID>
 
         Creates from the programmatic UIKit template and integrates an Icon Studio icon.
-        check signs a Debug device build, verifies its signature, builds and launches in a simulator,
-        captures a screenshot, and restores a simulator it booted to shutdown. Logs stay in Library/Caches.
-        check is a startup smoke check; app-specific behavior still needs verification.
-        Signing uses cached credentials unless --allow-provisioning-updates is supplied.
+        check builds and launches in a simulator, captures a screenshot, and restores a simulator
+        it booted to shutdown. Logs stay in Library/Caches.
+        testflight registers the app and personal tester, verifies a signed Release archive,
+        uploads, and waits for internal availability. No browser or simulator is required.
+        check is optional for simulator/behavior verification; it is not needed before testflight.
+        login performs the occasional Apple CLI password/2FA sign-in in Terminal.
         Personal defaults: ~/.config/uikit-app/config.json (team and bundlePrefix).
         """)
+    } else if arguments == ["login"] {
+        try login()
     } else {
         guard arguments.count >= 2 else { throw CommandError(message: "Use uikit-app --help") }
         switch arguments[0] {
@@ -183,11 +179,14 @@ do {
         case "create":
             try create(name: arguments[1], options: Options(arguments.dropFirst(2), allowed: ["--icon", "--output", "--team", "--bundle-id", "--deployment-target"]))
         case "check":
-            try check(directory: arguments[1], options: Options(arguments.dropFirst(2), allowed: ["--simulator", "--allow-provisioning-updates"]))
+            try check(directory: arguments[1], options: Options(arguments.dropFirst(2), allowed: ["--simulator"]))
         default:
             throw CommandError(message: "Unknown command: \(arguments[0]). Use uikit-app --help")
         }
     }
+} catch let action as RequiredAction {
+    try? emit(["result": action.result, "message": action.message, "action": action.command])
+    exit(2)
 } catch {
     status(error.localizedDescription)
     exit(1)
