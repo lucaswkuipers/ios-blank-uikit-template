@@ -46,7 +46,7 @@ struct SimulatorList: Decodable {
 }
 
 let files = FileManager.default
-let repository = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+let repository = Bundle.main.executableURL!.resolvingSymlinksInPath()
     .deletingLastPathComponent().deletingLastPathComponent()
 
 func status(_ message: String) {
