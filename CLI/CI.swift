@@ -141,12 +141,15 @@ func publish(directory: String) throws {
     }
     let commit = try github.git(root, ["rev-parse", "HEAD"], remote: false)
     let skippedPush = skipsPushWorkflow(try github.git(root, ["log", "-1", "--format=%B"], remote: false))
+    let dispatchDirectory = TestFlightConfiguration.directory.appendingPathComponent("workflow-dispatches/\(metadata.name)")
+    try files.createDirectory(at: dispatchDirectory, withIntermediateDirectories: true)
+    let dispatchReceipt = dispatchDirectory.appendingPathComponent(commit)
+    var dispatched = files.fileExists(atPath: dispatchReceipt.path)
     try github.git(root, ["remote", "set-url", "origin", "git@github.com-personal:lucaswkuipers/\(metadata.name).git"], remote: false)
     try github.git(root, ["push", "origin", "main"], remote: true)
     status("Waiting for GitHub's \(metadata.route.rawValue) delivery of \(commit.prefix(7))…")
     let deadline = Date().addingTimeInterval(3000)
-    var registrationDeadline = Date().addingTimeInterval(skippedPush ? 0 : 90)
-    var dispatched = false
+    var registrationDeadline = Date().addingTimeInterval(skippedPush && !dispatched ? 0 : 90)
     var previousStatus = ""
     while Date() < deadline {
         let output = try github.call(["run", "list", "--repo", repository.nameWithOwner, "--workflow", metadata.route.workflow, "--commit", commit, "--json", "databaseId,status,conclusion,url", "--limit", "1"])
@@ -177,6 +180,7 @@ func publish(directory: String) throws {
             }
             status("Starting the missing \(metadata.route.rawValue) workflow for this commit…")
             try github.call(["workflow", "run", metadata.route.workflow, "--repo", repository.nameWithOwner, "--ref", "main"])
+            try "accepted\n".write(to: dispatchReceipt, atomically: true, encoding: .utf8)
             dispatched = true
             registrationDeadline = Date().addingTimeInterval(90)
         }

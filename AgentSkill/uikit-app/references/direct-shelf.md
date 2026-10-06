@@ -18,6 +18,8 @@ The machine-wide `delivery: shelf` setting makes `create` install the shelf push
 
 An explicit `publish` starts the workflow if the commit skipped CI or no push run appeared within 90 seconds. It checks the remote commit before dispatching and prevents concurrent publish waiters. If GitHub has accepted a dispatch but has not listed it after another 90 seconds, it reports pending; resume with `publish`, without manually dispatching another workflow. A completed publish reuses its existing run. Failed runs still require fixing the reported failure or rerunning that workflow.
 
+Accepted dispatches are recorded per app and commit in `~/.config/uikit-app/workflow-dispatches`, so restarting the CLI does not dispatch again merely because GitHub has delayed listing the run. If a run was intentionally deleted, inspect GitHub before removing its matching local receipt or explicitly dispatching a replacement. A network error during dispatch can have an uncertain outcome; inspect the run list before retrying.
+
 `setup-direct` verifies the personal Apple account, registers only the selected device if needed, and creates/imports a personal Distribution identity. The first use can require Lucas to approve a macOS Keychain prompt. No password belongs in chat or a repository.
 
 `package` builds one signed Release archive, exports with a personal Ad Hoc profile containing exactly the configured iPhone, then verifies the exported IPA's signature, bundle/build identity, profile, and expiry. Signing configuration lives in `~/.config/uikit-app/direct.json`; private signing material never belongs in Git.
