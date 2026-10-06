@@ -47,6 +47,18 @@ do {
     try expectFailure { try verifyPersonalSettings(otherBundle, expectedBundle: "co.amo.Test") }
     try expectFailure { try verifyPersonalSettings(personal, expectedBundle: "com.lucaswkuipers.Other") }
 
+    try PersonalRepository(nameWithOwner: "lucaswkuipers/Example", isPrivate: true, url: "https://github.com/lucaswkuipers/Example").verify(name: "Example")
+    try expectFailure { try PersonalRepository(nameWithOwner: "lucaswkuipers/Example", isPrivate: false, url: "").verify(name: "Example") }
+    try expectFailure { try PersonalRepository(nameWithOwner: "wesprint-io/Example", isPrivate: true, url: "").verify(name: "Example") }
+    try expectFailure { try PersonalRepository(nameWithOwner: "lucaswkuipers/Another", isPrivate: true, url: "").verify(name: "Example") }
+    try verifyPersonalRemote("git@github.com-personal:lucaswkuipers/Example.git", name: "Example")
+    try verifyPersonalRemote("https://github.com/lucaswkuipers/Example.git", name: "Example")
+    try expectFailure { try verifyPersonalRemote("git@github.com:wesprint-io/Example.git", name: "Example") }
+    try expectFailure { try verifyPersonalRemote("https://github.com/other/Example.git", name: "Example") }
+    try expectFailure { try verifyPersonalRemote("https://github.com.evil.invalid/lucaswkuipers/Example.git", name: "Example") }
+    let localOptions = try Options(["--local-only", "--icon", "bolt"], allowed: ["--local-only", "--icon"])
+    try expect(localOptions.localOnly && localOptions.values["--icon"] == "bolt", "Local-only creation must skip remote setup without consuming the next argument")
+
     try expect(try nextBuildNumber(nil) == "1", "Initial build number")
     try expect(try nextBuildNumber("42") == "43", "Integer build number")
     try expect(try nextBuildNumber("42.9.1") == "43", "Dotted build number")

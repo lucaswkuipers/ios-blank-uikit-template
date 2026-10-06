@@ -24,6 +24,17 @@ xcuserdata/
 *.ipa
 *.dSYM.zip
 *.dSYM
+*.xcarchive/
+
+# Local credentials
+.env
+.env.*
+!.env.example
+*.p8
+*.p12
+*.pem
+*.mobileprovision
+.asc/
 
 # Swift Package Manager
 .build/

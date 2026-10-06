@@ -319,6 +319,13 @@ func deliverTestFlight(directory: String, options: Options) throws {
     try state.save(stateURL)
     let archive = URL(fileURLWithPath: state.archivePath)
     let authentication = ["-allowProvisioningUpdates", "-authenticationKeyPath", configuration.keyPath, "-authenticationKeyID", configuration.keyID, "-authenticationKeyIssuerID", configuration.issuer]
+    if state.phase == "upload-started", options.retryUpload {
+        let existing = try client.list("/v1/builds", query: ["filter[app]": app.id, "filter[version]": state.buildNumber])
+        let uploads = try client.request("GET", path: "/v1/apps/\(app.id)/buildUploads", query: ["filter[cfBundleVersion]": state.buildNumber, "fields[buildUploads]": "cfBundleVersion,state", "sort": "-uploadedDate", "limit": "1"], body: nil)
+        let upload = try buildUploadStatus(uploads, buildNumber: state.buildNumber)
+        state.phase = existing.isEmpty && upload == nil ? "archived" : "uploaded"
+        try state.save(stateURL)
+    }
     if state.fingerprint != fingerprint && ["created", "archived"].contains(state.phase) {
         state.fingerprint = fingerprint
         state.phase = "created"
@@ -334,11 +341,6 @@ func deliverTestFlight(directory: String, options: Options) throws {
         state.phase = "archived"
         try state.save(stateURL)
     }
-    if state.phase == "upload-started", options.retryUpload {
-        let existing = try client.list("/v1/builds", query: ["filter[app]": app.id, "filter[version]": state.buildNumber])
-        state.phase = existing.isEmpty ? "archived" : "uploaded"
-        try state.save(stateURL)
-    }
     if state.phase == "archived" {
         try verifyArchive(archive: archive, metadata: metadata, buildNumber: state.buildNumber)
         let exportOptions: [String: Any] = ["method": "app-store-connect", "destination": "upload", "signingStyle": "automatic", "teamID": TestFlightConfiguration.personalTeam, "testFlightInternalTestingOnly": true, "manageAppVersionAndBuildNumber": false, "uploadSymbols": true]
@@ -347,7 +349,7 @@ func deliverTestFlight(directory: String, options: Options) throws {
         status("Uploading internal-only build \(state.buildNumber)…")
         state.phase = "upload-started"
         try state.save(stateURL)
-        try run("/usr/bin/xcodebuild", ["-exportArchive", "-archivePath", archive.path, "-exportOptionsPlist", optionsURL.path, "-exportPath", cache.appendingPathComponent("TestFlightExport").path, "-allowProvisioningUpdates"], log: cache.appendingPathComponent("testflight-upload.log"))
+        try run("/usr/bin/xcodebuild", ["-exportArchive", "-archivePath", archive.path, "-exportOptionsPlist", optionsURL.path, "-exportPath", cache.appendingPathComponent("TestFlightExport").path] + authentication, log: cache.appendingPathComponent("testflight-upload.log"))
         state.phase = "uploaded"
         try state.save(stateURL)
     }

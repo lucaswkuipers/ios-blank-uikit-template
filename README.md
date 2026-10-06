@@ -4,12 +4,12 @@ Minimal programmatic UIKit iOS app template for Xcode. No storyboards, no boiler
 
 ## Command line
 
-Requires Xcode 27 or later and the local Icon Studio CLI.
+Requires Xcode 27 or later, the local Icon Studio CLI, and GitHub CLI authenticated as Lucas's personal account. Automatic repository setup uses this Mac's `github.com-personal` SSH host.
 
 ```bash
 ./CLI/install.sh
 uikit-app create Calories --icon calories --output /path/to/new/Calories \
-  --team YOURTEAMID --bundle-id com.example.Calories
+  --team YOURTEAMID --bundle-id com.example.Calories --local-only
 ```
 
 For repeated use, save `team` and `bundlePrefix` in `~/.config/uikit-app/config.json`:
@@ -22,11 +22,15 @@ Then agents only need:
 
 ```bash
 uikit-app create Calories --icon calories --output /path/to/new/Calories
-# Implement app features in the generated Swift sources.
-uikit-app testflight /path/to/new/Calories
+# Implement, review, and commit app features on main.
+uikit-app publish /path/to/new/Calories
 ```
 
-Creation copies the canonical template, writes a shared Xcode scheme, and integrates an icon with Lucas's Icon Studio preset. Output must be a new directory. The minimum iOS version defaults to the selected SDK; use `--deployment-target` to override it.
+Creation copies the canonical template, writes a shared Xcode scheme, and integrates an icon with Lucas's Icon Studio preset. It creates a private `lucaswkuipers/<Name>` GitHub repository and installs a repository-specific GitHub Actions runner on this Mac. The first scaffold commit skips CI. Output must be a new directory. The minimum iOS version defaults to the selected SDK; use `--deployment-target` to override it. `--local-only` skips repository/runner setup; `uikit-app setup-repo <directory>` adds or resumes it later.
+
+Every subsequent push to `main` triggers personal internal TestFlight delivery. `publish` pushes committed changes and waits for the exact commit's workflow, checking its delivery result before reporting availability. GitHub queues the latest pending update while another delivery runs; it does not cancel an upload in progress. The Mac must be awake, online, and logged into the user session running the service. The phone can be on another network. Runner configuration and logs live under `~/.local/share/uikit-app/runners/<Name>`; Apple signing credentials stay on the Mac. Each runner is scoped to one private repository; PRs do not trigger delivery.
+
+The CLI verifies the active personal GitHub account, remote ownership, and private visibility before pushing. It pins personal GitHub credentials and uses the personal SSH host. Existing public or other-owner remotes are rejected. Review and commit feature changes before publishing; failed runs link to GitHub logs, and rerunning the workflow resumes saved delivery state. Manual `testflight` remains available for recovery; do not run it in parallel with the same push's workflow.
 
 `testflight` performs the signed Release build and delivery. Simulator startup is optional: `uikit-app check /path/to/Calories` builds only for the simulator, installs, launches, checks that the process stays alive, and captures a screenshot. It uses a dedicated simulator per project and shuts it down afterward if it was not already booted. Pass `--simulator <UDID>` to choose another. JSON output contains app paths, screenshot, and complete logs under `~/Library/Caches/uikit-app`; startup alone does not prove feature correctness.
 

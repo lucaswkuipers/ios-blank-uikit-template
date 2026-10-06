@@ -17,6 +17,7 @@ struct CommandError: LocalizedError {
 struct Options {
     var values: [String: String] = [:]
     var retryUpload = false
+    var localOnly = false
 
     init(_ arguments: ArraySlice<String>, allowed: Set<String>) throws {
         var remaining = Array(arguments)
@@ -27,6 +28,10 @@ struct Options {
             }
             if key == "--retry-upload" {
                 retryUpload = true
+                continue
+            }
+            if key == "--local-only" {
+                localOnly = true
                 continue
             }
             guard !remaining.isEmpty, !remaining[0].hasPrefix("--"), values[key] == nil else {
@@ -71,7 +76,7 @@ func runInteractive(_ executable: String, arguments: [String], environment: [Str
 @discardableResult
 func run(_ executable: String, _ arguments: [String], log: URL?, environment: [String: String]? = nil, separateError: Bool = false) throws -> String {
     let output = log ?? files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-    guard files.createFile(atPath: output.path, contents: nil) else {
+    guard files.createFile(atPath: output.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
         throw CommandError(message: "Cannot create log: \(output.path)")
     }
     let handle = try FileHandle(forWritingTo: output)
@@ -92,7 +97,7 @@ func run(_ executable: String, _ arguments: [String], log: URL?, environment: [S
     let errorOutput = output.appendingPathExtension("stderr")
     let errorHandle: FileHandle?
     if separateError {
-        files.createFile(atPath: errorOutput.path, contents: nil)
+        files.createFile(atPath: errorOutput.path, contents: nil, attributes: [.posixPermissions: 0o600])
         errorHandle = try FileHandle(forWritingTo: errorOutput)
     } else { errorHandle = nil }
     defer {

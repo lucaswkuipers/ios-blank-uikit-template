@@ -1,0 +1,39 @@
+name: Personal TestFlight
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      retry-upload:
+        description: Retry a failed upload after reviewing its log
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-testflight
+  cancel-in-progress: false
+
+jobs:
+  deliver:
+    if: github.repository_owner == 'lucaswkuipers' && github.event.repository.private == true && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, macOS, ARM64, uikit-app-personal]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Deliver to personal internal TestFlight
+        shell: bash
+        env:
+          RETRY_UPLOAD: ${{ inputs.retry-upload }}
+        run: |
+          set -euo pipefail
+          arguments=(testflight "$GITHUB_WORKSPACE")
+          if [[ "$RETRY_UPLOAD" == "true" ]]; then arguments+=(--retry-upload); fi
+          result=$("$HOME/.local/bin/uikit-app" "${arguments[@]}")
+          printf '%s\n' "$result"
+          [[ "$result" == *'"result":"available-to-internal-tester"'* ]]
+          [[ "$result" == *'"sourcesChanged":"false"'* ]]

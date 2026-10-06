@@ -84,7 +84,15 @@ func create(name: String, options: Options) throws {
     try files.copyItem(at: iconOutput.appendingPathComponent("AppIcon.appiconset"), to: appIcon)
     try files.removeItem(at: iconOutput)
     try files.moveItem(at: staging, to: destination)
-    try emit(["project": destination.appendingPathComponent("\(name).xcodeproj").path, "bundleIdentifier": bundleIdentifier, "team": team, "deploymentTarget": deploymentTarget])
+    var result = ["project": destination.appendingPathComponent("\(name).xcodeproj").path, "bundleIdentifier": bundleIdentifier, "team": team, "deploymentTarget": deploymentTarget]
+    if !options.localOnly {
+        do {
+            result["repository"] = try setupAppRepository(directory: destination.path, template: repository).url
+        } catch {
+            throw RequiredAction(result: "needs-github-setup", message: "App saved at \(destination.path). \(error.localizedDescription)", command: "uikit-app setup-repo \(destination.path)")
+        }
+    }
+    try emit(result)
 }
 
 func check(directory: String, options: Options) throws {
@@ -152,13 +160,19 @@ do {
     if arguments.isEmpty || arguments == ["--help"] || arguments == ["help"] {
         print("""
         uikit-app create <Name> --icon <purpose-or-symbol> --output <new-directory>
-          [--team <ID>] [--bundle-id <ID>] [--deployment-target <version>]
+          [--team <ID>] [--bundle-id <ID>] [--deployment-target <version>] [--local-only]
+        uikit-app setup-repo <project-directory>
+        uikit-app publish <project-directory>
         uikit-app check <project-directory> [--simulator <UDID>]
         uikit-app testflight <project-directory> [--wait-seconds <seconds>] [--retry-upload]
         uikit-app login
         uikit-app setup-testflight --key <file.p8> --key-id <ID> --issuer <UUID> --tester <email> --account-bundle <existing-personal-bundle-ID>
 
         Creates from the programmatic UIKit template and integrates an Icon Studio icon.
+        create also creates a private lucaswkuipers repository and installs its Mac CI runner.
+        --local-only skips GitHub and CI setup. setup-repo resumes or adds that setup later.
+        Commit app features, then publish pushes main and waits for its TestFlight workflow.
+        Every subsequent push to main triggers delivery automatically while the Mac is available.
         check builds and launches in a simulator, captures a screenshot, and restores a simulator
         it booted to shutdown. Logs stay in Library/Caches.
         testflight registers the app and personal tester, verifies a signed Release archive,
@@ -176,8 +190,15 @@ do {
             try setupTestFlight(options: Options(arguments.dropFirst(), allowed: ["--key", "--key-id", "--issuer", "--tester", "--account-bundle"]))
         case "testflight":
             try deliverTestFlight(directory: arguments[1], options: Options(arguments.dropFirst(2), allowed: ["--wait-seconds", "--retry-upload"]))
+        case "setup-repo":
+            _ = try Options(arguments.dropFirst(2), allowed: [])
+            let github = try setupAppRepository(directory: arguments[1], template: repository)
+            try emit(["result": "private-repository-ready", "repository": github.url, "owner": "lucaswkuipers"])
+        case "publish":
+            _ = try Options(arguments.dropFirst(2), allowed: [])
+            try publish(directory: arguments[1])
         case "create":
-            try create(name: arguments[1], options: Options(arguments.dropFirst(2), allowed: ["--icon", "--output", "--team", "--bundle-id", "--deployment-target"]))
+            try create(name: arguments[1], options: Options(arguments.dropFirst(2), allowed: ["--icon", "--output", "--team", "--bundle-id", "--deployment-target", "--local-only"]))
         case "check":
             try check(directory: arguments[1], options: Options(arguments.dropFirst(2), allowed: ["--simulator"]))
         default:
