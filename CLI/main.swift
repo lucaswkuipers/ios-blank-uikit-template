@@ -1,39 +1,6 @@
 import CryptoKit
 import Foundation
 
-struct CommandError: LocalizedError {
-    let message: String
-    var errorDescription: String? { message }
-}
-
-struct Options {
-    var values: [String: String] = [:]
-    var provisioningUpdates = false
-
-    init(_ arguments: ArraySlice<String>, allowed: Set<String>) throws {
-        var remaining = Array(arguments)
-        while !remaining.isEmpty {
-            let key = remaining.removeFirst()
-            guard allowed.contains(key) else {
-                throw CommandError(message: "Unknown option: \(key)")
-            }
-            if key == "--allow-provisioning-updates" {
-                provisioningUpdates = true
-                continue
-            }
-            guard !remaining.isEmpty, !remaining[0].hasPrefix("--"), values[key] == nil else {
-                throw CommandError(message: "Provide one value for \(key)")
-            }
-            values[key] = remaining.removeFirst()
-        }
-    }
-}
-
-struct Project: Codable {
-    let name: String
-    let bundleIdentifier: String
-}
-
 struct Simulator: Decodable {
     let name: String
     let udid: String
@@ -45,50 +12,8 @@ struct SimulatorList: Decodable {
     let devices: [String: [Simulator]]
 }
 
-let files = FileManager.default
 let repository = Bundle.main.executableURL!.resolvingSymlinksInPath()
     .deletingLastPathComponent().deletingLastPathComponent()
-
-func status(_ message: String) {
-    FileHandle.standardError.write(Data((message + "\n").utf8))
-}
-
-@discardableResult
-func run(_ executable: String, _ arguments: [String], log: URL?) throws -> String {
-    let output = log ?? files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-    guard files.createFile(atPath: output.path, contents: nil) else {
-        throw CommandError(message: "Cannot create log: \(output.path)")
-    }
-    let handle = try FileHandle(forWritingTo: output)
-    defer {
-        try? handle.close()
-        if log == nil { try? files.removeItem(at: output) }
-    }
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: executable)
-    process.arguments = arguments
-    process.standardOutput = handle
-    process.standardError = handle
-    try process.run()
-    process.waitUntilExit()
-    let text = try String(contentsOf: output, encoding: .utf8)
-    guard process.terminationStatus == 0 else {
-        let tail = text.split(separator: "\n").suffix(18).joined(separator: "\n")
-        throw CommandError(message: "\(URL(fileURLWithPath: executable).lastPathComponent) failed (\(process.terminationStatus))\(log.map { "; log: \($0.path)" } ?? "")\n\(tail)")
-    }
-    return text.trimmingCharacters(in: .whitespacesAndNewlines)
-}
-
-func validate(_ value: String, pattern: String, label: String) throws {
-    guard value.range(of: pattern, options: .regularExpression) != nil else {
-        throw CommandError(message: "Invalid \(label): \(value)")
-    }
-}
-
-func emit(_ result: [String: String]) throws {
-    let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys, .withoutEscapingSlashes])
-    print(String(decoding: data, as: UTF8.self))
-}
 
 func create(name: String, options: Options) throws {
     try validate(name, pattern: "^[A-Za-z][A-Za-z0-9]*$", label: "project name (use letters and digits)")
@@ -238,6 +163,8 @@ do {
         uikit-app create <Name> --icon <purpose-or-symbol> --output <new-directory>
           [--team <ID>] [--bundle-id <ID>] [--deployment-target <version>]
         uikit-app check <project-directory> [--simulator <UDID>] [--allow-provisioning-updates]
+        uikit-app testflight <project-directory> [--wait-seconds <seconds>] [--retry-upload]
+        uikit-app setup-testflight --key <file.p8> --key-id <ID> --issuer <UUID> --tester <email> --account-bundle <existing-personal-bundle-ID>
 
         Creates from the programmatic UIKit template and integrates an Icon Studio icon.
         check signs a Debug device build, verifies its signature, builds and launches in a simulator,
@@ -249,6 +176,10 @@ do {
     } else {
         guard arguments.count >= 2 else { throw CommandError(message: "Use uikit-app --help") }
         switch arguments[0] {
+        case "setup-testflight":
+            try setupTestFlight(options: Options(arguments.dropFirst(), allowed: ["--key", "--key-id", "--issuer", "--tester", "--account-bundle"]))
+        case "testflight":
+            try deliverTestFlight(directory: arguments[1], options: Options(arguments.dropFirst(2), allowed: ["--wait-seconds", "--retry-upload"]))
         case "create":
             try create(name: arguments[1], options: Options(arguments.dropFirst(2), allowed: ["--icon", "--output", "--team", "--bundle-id", "--deployment-target"]))
         case "check":

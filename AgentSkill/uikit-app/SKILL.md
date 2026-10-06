@@ -1,6 +1,6 @@
 ---
 name: uikit-app
-description: Create new personal iOS apps from Lucas's programmatic UIKit template, with an icon, automatic signing, and a simulator launch check. Use for new iOS app implementation, respecting explicit framework choices; not existing-app rewrites or planning-only requests.
+description: Turn new personal iOS app ideas into programmatic UIKit apps with icons, signing, simulator checks, and private internal TestFlight delivery. Use for new iOS app implementation, respecting explicit framework choices; not existing-app rewrites or planning-only requests.
 ---
 
 # UIKit App
@@ -23,4 +23,18 @@ uikit-app check /absolute/Calories
 
 This verifies a signed Debug device build and simulator startup, returns compact JSON with app, log, and screenshot paths, and restores a simulator it booted to shutdown. It uses a dedicated simulator per project; pass `--simulator <UDID>` to select one. Review the screenshot and check the app's actual behavior as appropriate; startup alone does not establish feature correctness.
 
-Signing uses existing credentials first. If provisioning is missing, retry once with `--allow-provisioning-updates` to let the configured Xcode account manage development signing. Report account/permission failures; do not switch Apple accounts or seek private keys. Physical-device installation, distribution, and uploading are separate actions requested by the user.
+Signing uses existing credentials first. If provisioning is missing, retry once with `--allow-provisioning-updates` for development signing.
+
+Finish new app ideas with private TestFlight delivery:
+
+```sh
+uikit-app testflight /absolute/Calories
+```
+
+This is authorized for Lucas's personal account, team `AR7T5G5Z83`, with only his configured tester in the internal Personal group. Never use amo's account. The CLI checks the remote account and project team, archives, uploads an internal-only build, waits for Apple processing, and assigns the build. Keys stay in `~/.config/uikit-app`; never print or commit them. Determine the app's actual encryption use and set `ITSAppUsesNonExemptEncryption` accordingly before delivery.
+
+For `needs-app-record`, create the returned iOS app record once at the returned App Store Connect URL, verifying the personal account. Use the supplied name, bundle ID, SKU, English (U.S.), and Limited Access. Then rerun the command. Apple's public API cannot create this record.
+
+Only `available-to-internal-tester` confirms delivery; it does not prove installation or notification receipt. For `processing`, rerun the same command to resume, without recreating the app or upload. If `sourcesChanged` is true, rerun to deliver the newer source. Use `--retry-upload` only after the upload log shows a failed attempt; it retains the same build number. Account/legal failures need user action. For missing initial configuration, read [setup and recovery](references/testflight-setup.md).
+
+Physical-device installation, external testing, and App Store submission remain separate user requests.
