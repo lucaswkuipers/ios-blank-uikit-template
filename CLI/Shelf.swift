@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 
 struct ShelfApplication: Codable {
     let name: String
@@ -14,6 +15,7 @@ struct ShelfApplication: Codable {
     let publishedAt: Date
     var manifestAssetID: Int?
     var installExpiration: Date?
+    var iconPNG: String?
 }
 
 struct ShelfCatalog: Codable {
@@ -304,7 +306,7 @@ func deliverDirect(directory: String) throws {
         guard asset.size == package.size, asset.digest == "sha256:\(package.sha256)" else {
             throw CommandError(message: "GitHub's uploaded package size or checksum differs. The release remains a draft.")
         }
-        application = ShelfApplication(name: package.name, bundleIdentifier: package.bundleIdentifier, version: package.version, build: package.build, minimumOSVersion: package.minimumOSVersion, profileExpiration: package.profileExpiration, sourceCommit: commit, sha256: package.sha256, size: package.size, packageAssetID: asset.id, publishedAt: Date(), manifestAssetID: nil, installExpiration: nil)
+        application = ShelfApplication(name: package.name, bundleIdentifier: package.bundleIdentifier, version: package.version, build: package.build, minimumOSVersion: package.minimumOSVersion, profileExpiration: package.profileExpiration, sourceCommit: commit, sha256: package.sha256, size: package.size, packageAssetID: asset.id, publishedAt: Date(), manifestAssetID: nil, installExpiration: nil, iconPNG: try shelfIcon(root: root, name: metadata.name))
         try store.updateBody(application, releaseID: artifactRelease.id)
         let request = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? files.removeItem(at: request) }
@@ -332,4 +334,31 @@ func deliverDirect(directory: String) throws {
         _ = try store.refresh()
     }
     try emit(["result": "available-in-shelf", "app": metadata.name, "build": build, "team": TestFlightConfiguration.personalTeam, "sourcesChanged": String(try sourceFingerprint(root) != package.fingerprint)])
+}
+
+func shelfIcon(root: URL, name: String) throws -> String? {
+    let directory = root.appendingPathComponent("\(name)/Assets.xcassets/AppIcon.appiconset")
+    let contents = directory.appendingPathComponent("Contents.json")
+    guard files.fileExists(atPath: contents.path) else { return nil }
+    struct Contents: Decodable {
+        struct Image: Decodable { let filename: String? }
+        let images: [Image]
+    }
+    let catalog = try JSONDecoder().decode(Contents.self, from: Data(contentsOf: contents))
+    guard let filename = catalog.images.compactMap(\.filename).first,
+          !filename.contains("/"), !filename.contains(".."),
+          let source = CGImageSourceCreateWithURL(directory.appendingPathComponent(filename) as CFURL, nil),
+          let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: 128
+          ] as CFDictionary) else {
+        throw CommandError(message: "Cannot read the app icon for the shelf.")
+    }
+    let data = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else {
+        throw CommandError(message: "Cannot create the shelf icon.")
+    }
+    CGImageDestinationAddImage(destination, image, nil)
+    guard CGImageDestinationFinalize(destination) else { throw CommandError(message: "Cannot encode the shelf icon.") }
+    return (data as Data).base64EncodedString()
 }
