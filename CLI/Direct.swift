@@ -116,7 +116,7 @@ func verifyDirectProfile(_ profile: [String: Any], bundle: String, deviceUDID: S
     return expiration
 }
 
-func directProfile(client: AppStoreClient, configuration: DirectConfiguration, metadata: Project, cache: URL) throws -> String {
+func directProfile(client: AppStoreClient, configuration: DirectConfiguration, metadata: Project, cache: URL, capabilityRevision: String) throws -> String {
     let bundles = try client.list("/v1/bundleIds", query: ["filter[identifier]": metadata.bundleIdentifier])
     let bundle: AppleResource
     if let existing = bundles.first {
@@ -127,7 +127,7 @@ func directProfile(client: AppStoreClient, configuration: DirectConfiguration, m
     } else {
         bundle = try client.create(type: "bundleIds", attributes: ["identifier": metadata.bundleIdentifier, "name": metadata.name, "platform": "IOS"], relationships: [:])
     }
-    let profileName = "UIKit App \(metadata.bundleIdentifier) \(configuration.deviceID) \(configuration.certificateID)"
+    let profileName = "UIKit App \(metadata.bundleIdentifier) \(configuration.deviceID) \(configuration.certificateID)\(capabilityRevision)"
     let profiles = try client.list("/v1/profiles", query: ["filter[name]": profileName, "filter[profileType]": "IOS_APP_ADHOC", "filter[profileState]": "ACTIVE"])
     let profile: AppleResource
     if let existing = profiles.first {
@@ -200,7 +200,23 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
         throw CommandError(message: "Direct packaging currently requires one application target; extension profiles need explicit support.")
     }
     try verifyPersonalSettings(settings, expectedBundle: metadata.bundleIdentifier)
-    let profile = try directProfile(client: client, configuration: configuration, metadata: metadata, cache: cache)
+    var entitlements: [String: Any] = [:]
+    if let path = settings["CODE_SIGN_ENTITLEMENTS"] as? String, !path.isEmpty {
+        let data = try Data(contentsOf: root.appendingPathComponent(path))
+        guard let values = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else {
+            throw CommandError(message: "Cannot read the app's signing entitlements.")
+        }
+        entitlements = values
+    }
+    let cloudEnvironment = entitlements["com.apple.developer.icloud-container-environment"] as? String
+    let capabilityRevision: String
+    if entitlements["aps-environment"] != nil || cloudEnvironment != nil {
+        let data = try PropertyListSerialization.data(fromPropertyList: entitlements, format: .xml, options: 0)
+        capabilityRevision = " " + SHA256.hash(data: data).prefix(6).map { String(format: "%02x", $0) }.joined()
+    } else {
+        capabilityRevision = ""
+    }
+    let profile = try directProfile(client: client, configuration: configuration, metadata: metadata, cache: cache, capabilityRevision: capabilityRevision)
     let archive = cache.appendingPathComponent("Direct.xcarchive")
     if files.fileExists(atPath: archive.path) { try files.removeItem(at: archive) }
     status("Archiving \(metadata.name) build \(build) for the personal iPhone…")
@@ -209,7 +225,8 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
         throw CommandError(message: "Sources changed during the archive. Finish edits and rerun; no package was published.")
     }
     let export = cache.appendingPathComponent("Export")
-    let options: [String: Any] = ["method": "release-testing", "destination": "export", "signingStyle": "manual", "teamID": TestFlightConfiguration.personalTeam, "signingCertificate": configuration.certificateSHA1, "provisioningProfiles": [metadata.bundleIdentifier: profile], "manageAppVersionAndBuildNumber": false, "stripSwiftSymbols": true, "thinning": "<none>"]
+    var options: [String: Any] = ["method": "release-testing", "destination": "export", "signingStyle": "manual", "teamID": TestFlightConfiguration.personalTeam, "signingCertificate": configuration.certificateSHA1, "provisioningProfiles": [metadata.bundleIdentifier: profile], "manageAppVersionAndBuildNumber": false, "stripSwiftSymbols": true, "thinning": "<none>"]
+    if let cloudEnvironment { options["iCloudContainerEnvironment"] = cloudEnvironment }
     let optionsFile = cache.appendingPathComponent("ExportOptions.plist")
     try PropertyListSerialization.data(fromPropertyList: options, format: .xml, options: 0).write(to: optionsFile, options: .atomic)
     try run("/usr/bin/xcodebuild", ["-exportArchive", "-archivePath", archive.path, "-exportOptionsPlist", optionsFile.path, "-exportPath", export.path], log: cache.appendingPathComponent("export.log"))
@@ -232,6 +249,14 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
           let version = information["CFBundleShortVersionString"] as? String,
           let minimumOSVersion = information["MinimumOSVersion"] as? String else {
         throw CommandError(message: "Exported package identity or version does not match the requested app.")
+    }
+    if let cloudEnvironment {
+        let signed = try run("/usr/bin/codesign", ["-d", "--entitlements", ":-", application.path], log: nil, separateError: true)
+        guard let values = try PropertyListSerialization.propertyList(from: Data(signed.utf8), format: nil) as? [String: Any],
+              values["com.apple.developer.icloud-container-environment"] as? String == cloudEnvironment,
+              values["aps-environment"] as? String == entitlements["aps-environment"] as? String else {
+            throw CommandError(message: "Export changed the app's CloudKit or push environment.")
+        }
     }
     let expiration = try verifyDirectProfile(profileValues, bundle: metadata.bundleIdentifier, deviceUDID: configuration.deviceUDID)
     let data = try Data(contentsOf: package, options: .mappedIfSafe)
