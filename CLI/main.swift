@@ -52,7 +52,7 @@ func create(name: String, options: Options) throws {
     let source = staging.appendingPathComponent(name)
     try files.createDirectory(at: source, withIntermediateDirectories: false)
     let template = repository.appendingPathComponent("XcodeTemplate/iOS/Application/Programmatic UIKit App.xctemplate")
-    for file in ["SceneDelegate.swift", "ViewController.swift", "Info.plist", "Assets.xcassets"] {
+    for file in ["SceneDelegate.swift", "ViewController.swift", "Info.plist", "Assets.xcassets", "ShelfVersionReceipt.swift", "ShelfVersions.entitlements"] {
         try files.copyItem(at: template.appendingPathComponent(file), to: source.appendingPathComponent(file))
     }
     let project = staging.appendingPathComponent("\(name).xcodeproj")

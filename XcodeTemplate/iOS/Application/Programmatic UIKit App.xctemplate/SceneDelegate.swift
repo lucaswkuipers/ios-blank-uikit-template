@@ -13,4 +13,7 @@ final class SceneDelegate: UIResponder, UIApplicationDelegate, UIWindowSceneDele
         window!.rootViewController = ViewController()
         window!.makeKeyAndVisible()
     }
+    func sceneDidBecomeActive(_ scene: UIScene) {
+        ShelfVersionReceipt.recordCurrentBuild()
+    }
 }

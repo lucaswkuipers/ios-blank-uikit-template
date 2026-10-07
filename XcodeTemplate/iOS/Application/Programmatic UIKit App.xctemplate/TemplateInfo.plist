@@ -32,6 +32,8 @@
 		<string>SceneDelegate.swift</string>
 		<string>ViewController.swift</string>
 		<string>Info.plist</string>
+		<string>ShelfVersionReceipt.swift</string>
+		<string>ShelfVersions.entitlements</string>
 	</array>
 	<key>Definitions</key>
 	<dict>
@@ -79,6 +81,18 @@
 			<key>TargetIdentifiers</key>
 			<array/>
 		</dict>
+		<key>ShelfVersionReceipt.swift</key>
+		<dict>
+			<key>Path</key>
+			<string>ShelfVersionReceipt.swift</string>
+		</dict>
+		<key>ShelfVersions.entitlements</key>
+		<dict>
+			<key>Path</key>
+			<string>ShelfVersions.entitlements</string>
+			<key>TargetIdentifiers</key>
+			<array/>
+		</dict>
 	</dict>
 	<key>Targets</key>
 	<array>
@@ -117,6 +131,8 @@
 				<string>5.0</string>
 				<key>TARGETED_DEVICE_FAMILY</key>
 				<string>1</string>
+				<key>CODE_SIGN_ENTITLEMENTS</key>
+				<string>___PACKAGENAME___/ShelfVersions.entitlements</string>
 			</dict>
 		</dict>
 	</array>
