@@ -37,6 +37,8 @@ do {
     try files.createDirectory(at: temporary, withIntermediateDirectories: true)
     defer { try? files.removeItem(at: temporary) }
 
+    try testShelfNotifications(directory: temporary)
+
     let personal: [String: Any] = ["DEVELOPMENT_TEAM": "AR7T5G5Z83", "PRODUCT_BUNDLE_IDENTIFIER": "com.lucaswkuipers.Test", "CODE_SIGN_STYLE": "Automatic"]
     let legacyProject = try JSONDecoder().decode(Project.self, from: Data(#"{"name":"Test","bundleIdentifier":"com.lucaswkuipers.Test"}"#.utf8))
     try expect(legacyProject.route == .testflight, "Existing apps retain their verified delivery route")

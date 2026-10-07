@@ -16,6 +16,7 @@ struct ShelfApplication: Codable {
     var manifestAssetID: Int?
     var installExpiration: Date?
     var iconPNG: String?
+    var notificationTitle: String?
 }
 
 struct ShelfCatalog: Codable {
@@ -181,6 +182,7 @@ struct ShelfStore {
             changed = true
         }
         if changed { try updateBody(updated, releaseID: release.id) }
+        try publishShelfNotifications(updated)
         let activeIDs = Set(updated.applications.compactMap(\.manifestAssetID))
         for asset in release.assets where !activeIDs.contains(asset.id) {
             guard let created = ISO8601DateFormatter().date(from: asset.created_at), created < Date().addingTimeInterval(-7200) else { continue }
@@ -306,7 +308,7 @@ func deliverDirect(directory: String) throws {
         guard asset.size == package.size, asset.digest == "sha256:\(package.sha256)" else {
             throw CommandError(message: "GitHub's uploaded package size or checksum differs. The release remains a draft.")
         }
-        application = ShelfApplication(name: package.name, bundleIdentifier: package.bundleIdentifier, version: package.version, build: package.build, minimumOSVersion: package.minimumOSVersion, profileExpiration: package.profileExpiration, sourceCommit: commit, sha256: package.sha256, size: package.size, packageAssetID: asset.id, publishedAt: Date(), manifestAssetID: nil, installExpiration: nil, iconPNG: try shelfIcon(root: root, name: metadata.name))
+        application = ShelfApplication(name: package.name, bundleIdentifier: package.bundleIdentifier, version: package.version, build: package.build, minimumOSVersion: package.minimumOSVersion, profileExpiration: package.profileExpiration, sourceCommit: commit, sha256: package.sha256, size: package.size, packageAssetID: asset.id, publishedAt: Date(), manifestAssetID: nil, installExpiration: nil, iconPNG: try shelfIcon(root: root, name: metadata.name), notificationTitle: previous.applications.contains(where: { $0.bundleIdentifier == metadata.bundleIdentifier }) ? "Update available" : "New app available")
         try store.updateBody(application, releaseID: artifactRelease.id)
         let request = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? files.removeItem(at: request) }
