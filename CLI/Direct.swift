@@ -260,7 +260,7 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
     }
     let expiration = try verifyDirectProfile(profileValues, bundle: metadata.bundleIdentifier, deviceUDID: configuration.deviceUDID)
     let data = try Data(contentsOf: package, options: .mappedIfSafe)
-    let result = DirectPackage(name: metadata.name, bundleIdentifier: metadata.bundleIdentifier, version: version, build: build, minimumOSVersion: minimumOSVersion, profileExpiration: expiration, fingerprint: fingerprint, path: package.path, sha256: SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(), size: data.count)
+    let result = DirectPackage(name: information["CFBundleDisplayName"] as? String ?? metadata.name, bundleIdentifier: metadata.bundleIdentifier, version: version, build: build, minimumOSVersion: minimumOSVersion, profileExpiration: expiration, fingerprint: fingerprint, path: package.path, sha256: SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(), size: data.count)
     try JSONEncoder().encode(result).write(to: state, options: .atomic)
     return result
 }
