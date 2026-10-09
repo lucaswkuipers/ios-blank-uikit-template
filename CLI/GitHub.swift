@@ -24,37 +24,24 @@ struct PersonalGitHub {
         base["GH_HOST"] = "github.com"
         base["GH_PROMPT_DISABLED"] = "1"
         base["GIT_TERMINAL_PROMPT"] = "0"
-        try Self.verifyActiveAccount(environment: base)
         let token = try run(Self.executable, ["auth", "token", "--hostname", "github.com", "--user", "lucaswkuipers"], log: nil, environment: base)
         var authenticated = base
         authenticated["GH_TOKEN"] = token
+        guard try run(Self.executable, ["api", "user", "--jq", ".login"], log: nil, environment: authenticated) == "lucaswkuipers" else {
+            throw CommandError(message: "Personal GitHub login lucaswkuipers is required.")
+        }
         baseEnvironment = base
         environment = authenticated
     }
 
-    static func verifyActiveAccount(environment: [String: String]) throws {
-        let arguments = ["auth", "status", "--hostname", "github.com", "--active", "--json", "hosts", "--jq", ".hosts[\"github.com\"][] | select(.active and .state == \"success\") | .login"]
-        if try run(executable, arguments, log: nil, environment: environment) == "lucaswkuipers" {
-            return
-        }
-        try run(executable, ["auth", "switch", "--hostname", "github.com", "--user", "lucaswkuipers"], log: nil, environment: environment)
-        guard try run(executable, arguments, log: nil, environment: environment) == "lucaswkuipers" else {
-            throw CommandError(message: "Personal GitHub login lucaswkuipers is required.")
-        }
-    }
-
     @discardableResult
     func call(_ arguments: [String]) throws -> String {
-        try Self.verifyActiveAccount(environment: baseEnvironment)
-        return try run(Self.executable, arguments, log: nil, environment: environment, separateError: true)
+        try run(Self.executable, arguments, log: nil, environment: environment, separateError: true)
     }
 
     @discardableResult
     func git(_ root: URL, _ arguments: [String], remote: Bool) throws -> String {
-        if remote {
-            try Self.verifyActiveAccount(environment: baseEnvironment)
-        }
-        return try run("/usr/bin/git", ["-C", root.path] + arguments, log: nil, environment: baseEnvironment, separateError: true)
+        try run("/usr/bin/git", ["-C", root.path] + arguments, log: nil, environment: remote ? environment : baseEnvironment, separateError: true)
     }
 
     func repository(name: String) throws -> PersonalRepository {

@@ -127,7 +127,6 @@ struct ShelfStore {
     }
 
     func downloadLink(assetID: Int) throws -> (URL, Date) {
-        try PersonalGitHub.verifyActiveAccount(environment: github.baseEnvironment)
         let delegate = RejectRedirect()
         let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
         defer { session.invalidateAndCancel() }
