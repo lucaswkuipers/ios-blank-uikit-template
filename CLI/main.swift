@@ -185,6 +185,7 @@ do {
         uikit-app direct <project-directory>
         uikit-app refresh-shelf
         uikit-app setup-shelf-refresh
+        uikit-app setup-shelf-installs
         uikit-app setup-testflight --key <file.p8> --key-id <ID> --issuer <UUID> --tester <email> --account-bundle <existing-personal-bundle-ID>
 
         Creates from the programmatic UIKit template and integrates an Icon Studio icon.
@@ -207,6 +208,8 @@ do {
         try refreshShelf()
     } else if arguments == ["setup-shelf-refresh"] {
         try setupShelfRefresh()
+    } else if arguments == ["setup-shelf-installs"] {
+        try setupShelfInstalls()
     } else {
         guard arguments.count >= 2 else { throw CommandError(message: "Use uikit-app --help") }
         switch arguments[0] {

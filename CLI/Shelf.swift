@@ -207,10 +207,10 @@ func withShelfLock<T>(_ operation: () throws -> T) throws -> T {
 }
 
 func refreshShelf() throws {
-    try withShelfLock {
-        let catalog = try ShelfStore().refresh()
-        try emit(["result": "shelf-links-refreshed", "apps": String(catalog.applications.count)])
-    }
+    let store = try ShelfStore()
+    let catalog = try withShelfLock { try store.refresh() }
+    try emit(["result": "shelf-links-refreshed", "apps": String(catalog.applications.count)])
+    installShelfApplications(catalog, store: store)
 }
 
 func setupShelfRefresh() throws {

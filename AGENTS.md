@@ -1,5 +1,7 @@
 # Programmatic UIKit template
 
+`CLI/ShelfInstalls.swift` optionally reconciles catalog apps with the actual installed versions on the one configured personal iPhone. `setup-shelf-installs` enables it in the existing minute refresh. Only install signed personal Ad Hoc packages after validating catalog checksum, app identity, profile, and target device. Never launch apps, downgrade a newer device version, or use last-opened Keychain receipts as installation evidence. Installation runs outside the catalog lock and failures retry without failing catalog refresh. A physical `installed-on-device` result requires reading the installed version back from CoreDevice. Remove `~/.config/uikit-app/shelf-installs.json` to disable it.
+
 `XcodeTemplate/iOS/Application/Programmatic UIKit App.xctemplate` is the source of truth for app source files, assets, and Info.plist. `CLI/main.swift` copies it and fills `CLI/project.pbxproj`; keep that project's build settings consistent with TemplateInfo.plist when changing template defaults.
 
 Install the Swift CLI with `./CLI/install.sh`. Personal signing defaults live outside the repository in `~/.config/uikit-app/config.json`; never add credentials here. `AgentSkill/uikit-app` is shared with Codex and Claude through their skill-directory symlinks.

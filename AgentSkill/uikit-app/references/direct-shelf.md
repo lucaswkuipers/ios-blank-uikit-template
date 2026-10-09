@@ -11,6 +11,7 @@ uikit-app setup-direct --device <personal-iPhone-UDID> --name <device-name>
 uikit-app package <project-directory> --build <number>
 uikit-app direct <committed-project-directory>
 uikit-app setup-shelf-refresh
+uikit-app setup-shelf-installs
 uikit-app refresh-shelf
 ```
 
@@ -34,4 +35,6 @@ Small release asset URLs currently have a five-minute JWT lifetime even when the
 
 The shelf client accepts an ignored `ShelfAccess.generated.json` bootstrap file (`{"token":"..."}`), imports it into the iPhone's device-only Keychain, and allows replacement in Settings. Its push workflow copies this file from `~/.config/uikit-app/shelf-access.json`; never substitute the broad gh OAuth token. This one-time credential setup is complete. If rotated, verify private artifact reads succeed and private AppShelf source reads fail, and check the GitHub token's permissions remain Contents and Metadata read-only for AppShelf-builds alone. Binaries intentionally contain a recoverable artifact-only bootstrap credential, like Hop.
 
-Do not claim silent installation, reliable background notifications, device receipt, or remote install/update success from HTTP or simulator checks. iOS installation requires confirmation. TestFlight remains available through the existing CLI as fallback.
+`setup-shelf-installs` opts this Mac into automatic installs for the same iPhone as `direct.json`, saving its UDID in `~/.config/uikit-app/shelf-installs.json`. The existing minute refresh reads installed versions through CoreDevice and installs missing or newer catalog apps, without launching them. Same or newer device versions are preserved. It reuses local signed IPAs, caches downloaded packages, and checks checksums, app identity, signatures, and the personal single-device profile before installing. Installation has a separate lock and does not hold the catalog lock. An unreachable or locked device, failed install, or failed verification is left for a later refresh. USB or an available paired wireless connection is required; this is not internet-based remote management. Removing `shelf-installs.json` disables automatic installs. Logs are in `~/Library/Logs/uikit-app/shelf-refresh{,-error}.log`.
+
+Do not claim installation or update success from HTTP, simulator checks, or catalog availability. The Mac emits `installed-on-device` only after reading the exact version/build back from the phone; it never launches the app. Manual installation through AppShelf still uses iOS confirmation. TestFlight remains available through the existing CLI as fallback.

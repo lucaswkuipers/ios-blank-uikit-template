@@ -42,7 +42,7 @@ Each delivery route performs one signed Release archive. Simulator startup is op
 
 The shelf workflow runs `uikit-app direct <directory>`. It signs an Ad Hoc build for the configured personal iPhone and publishes immutable artifacts to private `lucaswkuipers/AppShelf-builds`. The phone app reads that repository with a separate read-only token, validates a temporary installation manifest, and opens the iOS installer. Lucas confirms installation on the phone. There is no TestFlight processing wait and no paid hosting service.
 
-The Mac's `uikit-app refresh-shelf` LaunchAgent keeps temporary GitHub install links valid. Keep the Mac awake for new installs and updates; already installed apps run independently until their signing expires. `available-in-shelf` means catalog availability, not installation receipt. Phone notifications are intentionally out of scope for now. See [direct shelf setup and recovery](AgentSkill/uikit-app/references/direct-shelf.md).
+The Mac's `uikit-app refresh-shelf` LaunchAgent keeps temporary GitHub install links valid. `uikit-app setup-shelf-installs` also enables automatic installation of missing apps and updates on the configured, paired personal iPhone whenever CoreDevice can reach it. Each minute, the Mac compares actual installed versions with the catalog, reuses signed packages, and installs without launching apps. Unavailable devices and failed installs are retried on later refreshes. Keep the Mac awake; already installed apps run independently until their signing expires. `available-in-shelf` means catalog availability; `installed-on-device` confirms the version was read back from the phone. See [direct shelf setup and recovery](AgentSkill/uikit-app/references/direct-shelf.md).
 
 ## Private TestFlight delivery
 
