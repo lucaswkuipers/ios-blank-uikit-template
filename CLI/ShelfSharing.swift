@@ -60,7 +60,28 @@ struct ShelfDevices {
 
 struct ShelfInvite {
     let link: String
+    let pinnedLink: String
+    let manifestURL: String
+    let manifest: Data
     let qrCode: URL
+}
+
+func shelfInstallLink(manifestURL: String) throws -> String {
+    var components = URLComponents()
+    components.scheme = "itms-services"
+    components.host = ""
+    components.queryItems = [URLQueryItem(name: "action", value: "download-manifest"), URLQueryItem(name: "url", value: manifestURL)]
+    guard let link = components.url?.absoluteString else {
+        throw CommandError(message: "Cannot create the AppShelf install link.")
+    }
+    return link
+}
+
+func appleDeviceName(_ name: String) -> String {
+    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: ".-_"))
+    let scalars = name.replacingOccurrences(of: "\u{2019}", with: "").replacingOccurrences(of: "'", with: "").unicodeScalars
+    let words = String(String.UnicodeScalarView(scalars.map { $0.isASCII && allowed.contains($0) ? $0 : " " })).split(separator: " ")
+    return words.isEmpty ? "Shared iPhone" : String(words.joined(separator: " ").prefix(50))
 }
 
 func shareShelf(options: Options) throws {
@@ -90,6 +111,11 @@ func shareShelf(options: Options) throws {
             try resignShelfApplication(shelf, store: store, devices: devices)
         }
         invite = try publishShelfInvite(store: store, devices: devices)
+        do {
+            try requests?.setInstallLink(invite.pinnedLink)
+        } catch {
+            status("The request page keeps its previous install link until the next share: \(error.localizedDescription)")
+        }
         try requests?.markReady(devices: devices)
         for application in outdated where application.bundleIdentifier != "com.lucaswkuipers.AppShelf" {
             do {
@@ -99,10 +125,19 @@ func shareShelf(options: Options) throws {
                 failures.append("\(application.name): \(error.localizedDescription)")
             }
         }
-        try requests?.finish(devices: devices, complete: failures.isEmpty)
+        try requests?.finish(devices: devices, failures: failures)
     } catch {
-        try requests?.fail(devices: devices)
+        do {
+            try requests?.fail(devices: devices, detail: error.localizedDescription)
+        } catch let failure {
+            status("Could not mark shelf requests as failed: \(failure.localizedDescription)")
+        }
         throw error
+    }
+    do {
+        try verifyPublicDownload(invite.manifestURL, expected: invite.manifest)
+    } catch {
+        status("The invite link may install the previous AppShelf build for a few more minutes: \(error.localizedDescription)")
     }
     let shared = try ShelfSharing.load().devices.map(\.name).joined(separator: ", ")
     try emit(["result": "shelf-shared", "sharedWith": shared, "invite": invite.link, "qrCode": invite.qrCode.path, "pendingApps": String(failures.count)])
@@ -123,6 +158,7 @@ func addShelfDevice(udid: String, name: String) throws {
         status("\(name) is already approved for the shelf.")
         return
     }
+    let registeredName = appleDeviceName(name)
     let client = try AppStoreClient(configuration: TestFlightConfiguration.load())
     try client.verifyPersonalAccount()
     let device: AppleResource
@@ -132,13 +168,13 @@ func addShelfDevice(udid: String, name: String) throws {
         }
         device = existing
     } else {
-        status("Registering \(name) with personal team \(TestFlightConfiguration.personalTeam)…")
-        device = try client.create(type: "devices", attributes: ["name": name, "udid": udid, "platform": "IOS"], relationships: [:])
+        status("Registering \(registeredName) with personal team \(TestFlightConfiguration.personalTeam)…")
+        device = try client.create(type: "devices", attributes: ["name": registeredName, "udid": udid, "platform": "IOS"], relationships: [:])
     }
     guard let registered = device.string("udid") else {
         throw CommandError(message: "Apple did not return the registered device UDID.")
     }
-    sharing.devices.append(ShelfSharedDevice(id: device.id, udid: registered, name: name))
+    sharing.devices.append(ShelfSharedDevice(id: device.id, udid: registered, name: registeredName))
     try sharing.save()
 }
 
@@ -159,28 +195,46 @@ func resignShelfApplication(_ application: ShelfApplication, store: ShelfStore, 
     try validate(asset.name, pattern: "^[A-Za-z][A-Za-z0-9]*\\.ipa$", label: "shelf package name")
     let repository = try store.github.repository(name: String(asset.name.dropLast(".ipa".count)))
     status("Re-signing \(application.name) for \(devices.udids.count) iPhones…")
-    try runShelfWorkflow(repository: repository.nameWithOwner, github: store.github)
-    let (_, updated) = try store.catalog()
-    guard let resigned = updated.applications.first(where: { $0.bundleIdentifier == application.bundleIdentifier }), devices.isCurrent(resigned) else {
-        throw CommandError(message: "Its workflow succeeded without publishing a build for every shelf iPhone.")
+    var workflowError: Error?
+    do {
+        try runShelfWorkflow(repository: repository.nameWithOwner, github: store.github)
+    } catch {
+        workflowError = error
     }
+    let (_, updated) = try store.catalog()
+    if let resigned = updated.applications.first(where: { $0.bundleIdentifier == application.bundleIdentifier }), devices.isCurrent(resigned) {
+        return
+    }
+    throw workflowError ?? CommandError(message: "Its workflow succeeded without publishing a build for every shelf iPhone.")
 }
 
 func runShelfWorkflow(repository: String, github: PersonalGitHub) throws {
     let list = ["run", "list", "--repo", repository, "--workflow", DeliveryRoute.shelf.workflow, "--event", "workflow_dispatch", "--json", "databaseId,status,conclusion,url", "--limit", "20"]
     let earlier = Set(try JSONDecoder().decode([DeliveryRun].self, from: Data(github.call(list).utf8)).map(\.databaseId))
     try github.call(["workflow", "run", DeliveryRoute.shelf.workflow, "--repo", repository, "--ref", "main"])
-    let deadline = Date().addingTimeInterval(2700)
+    let dispatched = Date()
+    let deadline = dispatched.addingTimeInterval(2700)
+    var waitingSince = dispatched
     var previousStatus = ""
     while Date() < deadline {
         Thread.sleep(forTimeInterval: 10)
         let runs = try JSONDecoder().decode([DeliveryRun].self, from: Data(github.call(list).utf8))
         guard let delivery = runs.first(where: { !earlier.contains($0.databaseId) }) else {
+            guard Date().timeIntervalSince(dispatched) < 300 else {
+                throw CommandError(message: "GitHub did not list the dispatched shelf workflow within five minutes.")
+            }
             continue
         }
         if delivery.status != previousStatus {
             status("GitHub delivery: \(delivery.status) — \(delivery.url)")
             previousStatus = delivery.status
+            waitingSince = Date()
+        }
+        if delivery.status != "in_progress" && delivery.status != "completed" {
+            guard Date().timeIntervalSince(waitingSince) < 900 else {
+                throw CommandError(message: "The Mac runner did not start the shelf workflow within 15 minutes: \(delivery.url)")
+            }
+            continue
         }
         guard delivery.status == "completed" else {
             continue
@@ -247,29 +301,25 @@ func publishShelfInvite(store: ShelfStore, devices: ShelfDevices) throws -> Shel
     try manifestData.write(to: checkout.appendingPathComponent("AppShelf.plist"), options: .atomic)
     try readme.write(to: checkout.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
     let manifestURL = "\(raw)/AppShelf.plist"
+    let pinnedManifestURL = "\(raw)/\(try store.github.git(checkout, ["hash-object", "AppShelf.plist"], remote: false))/AppShelf.plist"
     if try !store.github.git(checkout, ["status", "--porcelain"], remote: false).isEmpty {
         try store.github.git(checkout, ["add", "--all"], remote: false)
         try store.github.git(checkout, ["-c", "user.name=Lucas Werner Kuipers", "-c", "user.email=lucaswkuipers@gmail.com", "commit", "--quiet", "-m", "AppShelf \(application.version) (\(application.build))"], remote: false)
         try store.github.git(checkout, credentials + ["push", "--quiet", "origin", "HEAD"], remote: true)
     }
-    try verifyPublicDownload(packageURL, expected: Data(contentsOf: package), directory: work)
-    try verifyPublicDownload(manifestURL, expected: manifestData, directory: work)
-    var components = URLComponents()
-    components.scheme = "itms-services"
-    components.host = ""
-    components.queryItems = [URLQueryItem(name: "action", value: "download-manifest"), URLQueryItem(name: "url", value: manifestURL)]
-    guard let link = components.url?.absoluteString else {
-        throw CommandError(message: "Cannot create the AppShelf install link.")
-    }
+    try verifyPublicDownload(packageURL, expected: Data(contentsOf: package))
+    try verifyPublicDownload(pinnedManifestURL, expected: manifestData)
+    let link = try shelfInstallLink(manifestURL: manifestURL)
     let directory = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/ShelfInvite")
     try files.createDirectory(at: directory, withIntermediateDirectories: true)
     let qrCode = directory.appendingPathComponent("AppShelf-invite.png")
     try writeQRCode(link, to: qrCode)
-    return ShelfInvite(link: link, qrCode: qrCode)
+    return ShelfInvite(link: link, pinnedLink: try shelfInstallLink(manifestURL: pinnedManifestURL), manifestURL: manifestURL, manifest: manifestData, qrCode: qrCode)
 }
 
-func verifyPublicDownload(_ url: String, expected: Data, directory: URL) throws {
-    let download = directory.appendingPathComponent(UUID().uuidString)
+func verifyPublicDownload(_ url: String, expected: Data) throws {
+    let download = files.temporaryDirectory.appendingPathComponent("shelf-download-\(UUID().uuidString)")
+    defer { try? files.removeItem(at: download) }
     let deadline = Date().addingTimeInterval(420)
     var waiting = false
     while Date() < deadline {

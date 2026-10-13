@@ -40,6 +40,7 @@ do {
     try testShelfNotifications(directory: temporary)
     try testShelfInstalls(directory: temporary)
     try testShelfSharing(directory: temporary)
+    try testShelfRequests(directory: temporary)
 
     let personal: [String: Any] = ["DEVELOPMENT_TEAM": "AR7T5G5Z83", "PRODUCT_BUNDLE_IDENTIFIER": "com.lucaswkuipers.Test", "CODE_SIGN_STYLE": "Automatic"]
     let legacyProject = try JSONDecoder().decode(Project.self, from: Data(#"{"name":"Test","bundleIdentifier":"com.lucaswkuipers.Test"}"#.utf8))

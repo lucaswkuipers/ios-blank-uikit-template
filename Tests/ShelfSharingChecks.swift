@@ -17,6 +17,19 @@ func testShelfSharing(directory: URL) throws {
     application.deviceSet = shared.identifier
     try expect(shared.isCurrent(application) && !solo.isCurrent(application), "Re-signed catalog entries record their device set")
 
+    try expect(shared.includes("FRIEND-IPHONE") && !shared.includes("stranger-iphone"), "UDID matching ignores letter case")
+    try expect(appleDeviceName("Alex\u{2019}s iPhone") == "Alexs iPhone", "Apostrophes are dropped from Apple device names")
+    try expect(appleDeviceName("Zo\u{eb} \u{1F4F1} iPad!!") == "Zo iPad", "Apple device names keep plain ASCII words only")
+    try expect(appleDeviceName("\u{1F4F1}") == "Shared iPhone", "An empty Apple device name falls back to a readable name")
+    try expect(appleDeviceName(String(repeating: "a", count: 80)).count == 50, "Apple device names stay within 50 characters")
+    let record: [String: Any] = ["recordName": "request", "recordChangeTag": "tag", "fields": ["udid": ["value": "udid"], "deviceName": ["value": "Alex"], "status": ["value": "approved"]]]
+    let parsed = try ShelfAccessRecord(record)
+    try expect(parsed.status == "approved" && parsed.detail.isEmpty && parsed.changeTag == "tag", "Access requests parse from CloudKit records")
+    var incomplete = record
+    incomplete["fields"] = ["deviceName": ["value": "Alex"], "status": ["value": "approved"]]
+    try expectFailure { _ = try ShelfAccessRecord(incomplete) }
+    try expect(try shelfInstallLink(manifestURL: "https://example.com/raw/AppShelf.plist") == "itms-services://?action=download-manifest&url=https://example.com/raw/AppShelf.plist", "Install links keep the manifest URL readable")
+
     let link = "itms-services://?action=download-manifest&url=https://gist.githubusercontent.com/lucaswkuipers/0123456789abcdef0123456789abcdef/raw/0123456789abcdef0123456789abcdef01234567/AppShelf.plist"
     let qrCode = directory.appendingPathComponent("invite.png")
     try writeQRCode(link, to: qrCode)

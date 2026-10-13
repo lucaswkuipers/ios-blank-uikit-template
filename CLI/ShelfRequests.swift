@@ -29,6 +29,7 @@ struct ShelfAccessRecord {
     let udid: String
     let deviceName: String
     let status: String
+    let detail: String
 
     init(_ record: [String: Any]) throws {
         let fields = record["fields"] as? [String: Any] ?? [:]
@@ -44,6 +45,7 @@ struct ShelfAccessRecord {
         self.udid = udid
         self.deviceName = deviceName
         self.status = status
+        detail = value("detail") ?? ""
     }
 }
 
@@ -78,12 +80,23 @@ struct ShelfRequests {
         _ = try workerRequest("/admin/requests/\(id)", body: ["status": status])
     }
 
+    func setInstallLink(_ link: String) throws {
+        _ = try workerRequest("/admin/install", body: ["link": link])
+    }
+
     func records() throws -> [ShelfAccessRecord] {
         let results = try cloud.records(operation: "query", body: ["query": ["recordType": "ShelfAccessRequest"], "resultsLimit": 200])
         if let failure = results.first(where: { $0["serverErrorCode"] != nil }) {
-            throw CommandError(message: "CloudKit could not list access requests: \(failure["serverErrorCode"] ?? "unknown error").")
+            throw CommandError(message: "CloudKit could not list access requests: \(failure["serverErrorCode"] ?? "unknown error") \(failure["reason"] ?? "").")
         }
-        return try results.map(ShelfAccessRecord.init)
+        return results.compactMap { record in
+            do {
+                return try ShelfAccessRecord(record)
+            } catch {
+                status(error.localizedDescription)
+                return nil
+            }
+        }
     }
 
     func modify(_ operation: [String: Any]) throws {
@@ -93,8 +106,17 @@ struct ShelfRequests {
         }
     }
 
-    func setStatus(_ status: String, of record: ShelfAccessRecord) throws {
-        try modify(["operationType": "update", "record": ["recordType": "ShelfAccessRequest", "recordName": record.name, "recordChangeTag": record.changeTag, "fields": ["status": ["value": status]]]])
+    func setStatus(_ status: String, detail: String, of record: ShelfAccessRecord) throws {
+        let fields = ["status": ["value": status], "detail": ["value": String(detail.prefix(500))]]
+        try modify(["operationType": "update", "record": ["recordType": "ShelfAccessRequest", "recordName": record.name, "recordChangeTag": record.changeTag, "fields": fields]])
+    }
+
+    func update(_ record: ShelfAccessRecord, _ change: () throws -> Void) {
+        do {
+            try change()
+        } catch {
+            status("Could not update the access request for \(record.deviceName); the next refresh retries: \(error.localizedDescription)")
+        }
     }
 
     func delete(_ record: ShelfAccessRecord) throws {
@@ -123,29 +145,39 @@ struct ShelfRequests {
 
     func markReady(devices: ShelfDevices) throws {
         for record in try records() where record.status == "preparing" && devices.includes(record.udid) {
-            try setStatus("ready", of: record)
-            try updateWorker(record.name, status: "ready")
-        }
-    }
-
-    func finish(devices: ShelfDevices, complete: Bool) throws {
-        for record in try records() {
-            if ["preparing", "ready"].contains(record.status), devices.includes(record.udid) {
-                try setStatus(complete ? "shared" : "failed", of: record)
+            update(record) {
                 try updateWorker(record.name, status: "ready")
-            } else if record.status == "removing", !devices.includes(record.udid) {
-                try updateWorker(record.name, status: "removed")
-                try delete(record)
+                try setStatus("ready", detail: "", of: record)
             }
         }
     }
 
-    func fail(devices: ShelfDevices) throws {
+    func finish(devices: ShelfDevices, failures: [String]) throws {
         for record in try records() {
             if ["preparing", "ready"].contains(record.status), devices.includes(record.udid) {
-                try setStatus("failed", of: record)
+                update(record) {
+                    try updateWorker(record.name, status: "ready")
+                    try setStatus(failures.isEmpty ? "shared" : "failed", detail: failures.joined(separator: "\n"), of: record)
+                }
+            } else if record.status == "removing", !devices.includes(record.udid) {
+                update(record) {
+                    try updateWorker(record.name, status: "removed")
+                    try delete(record)
+                }
+            }
+        }
+    }
+
+    func fail(devices: ShelfDevices, detail: String) throws {
+        for record in try records() {
+            if ["preparing", "ready"].contains(record.status), devices.includes(record.udid) {
+                update(record) {
+                    try setStatus("failed", detail: detail, of: record)
+                }
             } else if record.status == "removing" {
-                try setStatus("remove-failed", of: record)
+                update(record) {
+                    try setStatus("remove-failed", detail: detail, of: record)
+                }
             }
         }
     }
@@ -171,12 +203,12 @@ func processShelfRequests() {
         for record in records where record.status == "approved" {
             do {
                 try addShelfDevice(udid: record.udid, name: record.deviceName)
-                try requests.setStatus("preparing", of: record)
+                try requests.setStatus("preparing", detail: "", of: record)
                 try requests.updateWorker(record.name, status: "preparing")
                 work = true
             } catch {
                 status("Could not approve \(record.deviceName): \(error.localizedDescription)")
-                try requests.setStatus("failed", of: record)
+                try requests.setStatus("failed", detail: error.localizedDescription, of: record)
             }
         }
         let sharing = try ShelfSharing.load()
@@ -185,7 +217,7 @@ func processShelfRequests() {
                 try removeShelfDevice(record.udid)
             }
             if record.status == "remove" {
-                try requests.setStatus("removing", of: record)
+                try requests.setStatus("removing", detail: "", of: record)
             }
             work = true
         }
@@ -194,7 +226,7 @@ func processShelfRequests() {
             if devices.includes(record.udid) {
                 work = true
             } else {
-                try requests.setStatus("failed", of: record)
+                try requests.setStatus("failed", detail: "This iPhone is no longer in the shelf's signing list.", of: record)
             }
         }
         if work {
@@ -345,12 +377,11 @@ func setupShelfRequests(template: URL) throws {
     guard let database = try database() else {
         throw CommandError(message: "Cloudflare did not list the appshelf-requests database after creating it.")
     }
-    var components = URLComponents()
-    components.scheme = "itms-services"
-    components.host = ""
-    components.queryItems = [URLQueryItem(name: "action", value: "download-manifest"), URLQueryItem(name: "url", value: "https://gist.githubusercontent.com/lucaswkuipers/\(gist)/raw/AppShelf.plist")]
-    guard let installLink = components.url?.absoluteString else {
-        throw CommandError(message: "Cannot create the AppShelf install link.")
+    let installLink = try shelfInstallLink(manifestURL: "https://gist.githubusercontent.com/lucaswkuipers/\(gist)/raw/AppShelf.plist")
+    let store = try ShelfStore()
+    let (_, catalog) = try store.catalog()
+    guard let shelf = catalog.applications.first(where: { $0.bundleIdentifier == "com.lucaswkuipers.AppShelf" }) else {
+        throw CommandError(message: "AppShelf is missing from the shelf catalog.")
     }
     let manifest = """
     name = "appshelf"
@@ -363,6 +394,7 @@ func setupShelfRequests(template: URL) throws {
     [vars]
     OWNER_NAME = "Lucas"
     INSTALL_LINK = "\(installLink)"
+    MINIMUM_SYSTEM = "\(shelf.minimumOSVersion)"
 
     [[d1_databases]]
     binding = "DB"
@@ -422,7 +454,6 @@ func setupShelfRequests(template: URL) throws {
             Thread.sleep(forTimeInterval: 5)
         }
     }
-    let store = try ShelfStore()
     try withShelfLock {
         let (release, catalog) = try store.catalog()
         var updated = catalog

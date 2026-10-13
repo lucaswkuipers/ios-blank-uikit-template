@@ -30,7 +30,7 @@ func appleRequest(_ request: URLRequest, session: URLSession = .shared) throws -
             }
             let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             let errors = body?["errors"] as? [[String: Any]] ?? []
-            let detail = errors.prefix(3).map { error in
+            let detail = errors.isEmpty ? ["serverErrorCode", "reason"].compactMap { body?[$0] as? String }.joined(separator: ": ") : errors.prefix(3).map { error in
                 ["code", "title", "detail"].compactMap { error[$0] as? String }.joined(separator: ": ")
             }.joined(separator: "\n")
             throw AppleHTTPError(status: response.statusCode, message: "\(request.url?.host ?? "Server") \(request.httpMethod ?? "GET") \(request.url?.path ?? ""): HTTP \(response.statusCode)\n\(detail.prefix(1800))")

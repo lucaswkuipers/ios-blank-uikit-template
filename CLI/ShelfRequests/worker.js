@@ -30,24 +30,28 @@ async function enroll(request, env) {
   if (!udid || !/^[0-9A-Fa-f-]{25,40}$/.test(udid)) {
     return new Response("This iPhone did not send its device ID.", { status: 400, headers: baseHeaders })
   }
+  const model = (attribute(plist, "PRODUCT") || "").slice(0, 40)
+  if (!/^(iPhone|iPad|iPod)/.test(model)) {
+    return new Response("Open this link on the iPhone you want to use.", { status: 400, headers: baseHeaders })
+  }
   const deviceName = (attribute(plist, "DEVICE_NAME") || "iPhone").slice(0, 50)
-  const model = (attribute(plist, "PRODUCT") || "iPhone").slice(0, 40)
   const systemVersion = (attribute(plist, "VERSION") || "").slice(0, 20)
   const now = new Date().toISOString()
-  const existing = await env.DB.prepare("SELECT id, status FROM requests WHERE udid = ?").bind(udid).first()
-  let id
-  if (existing) {
-    id = existing.id
-    if (existing.status === "declined" || existing.status === "removed") {
-      await env.DB.prepare("UPDATE requests SET status = 'pending', device_name = ?, model = ?, system_version = ?, updated_at = ? WHERE id = ?")
-        .bind(deviceName, model, systemVersion, now, id).run()
+  const known = await env.DB.prepare("SELECT id FROM requests WHERE udid = ?").bind(udid).first()
+  if (!known) {
+    const { waiting } = await env.DB.prepare("SELECT COUNT(*) AS waiting FROM requests WHERE status IN ('pending', 'waiting')").first()
+    if (waiting >= 20) {
+      return new Response("Too many requests are waiting for approval. Try again later.", { status: 429, headers: baseHeaders })
     }
-  } else {
-    id = crypto.randomUUID()
-    await env.DB.prepare("INSERT INTO requests (id, udid, device_name, model, system_version, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)")
-      .bind(id, udid, deviceName, model, systemVersion, now, now).run()
   }
-  return Response.redirect(`${new URL(request.url).origin}/?request=${id}`, 301)
+  await env.DB.prepare("INSERT INTO requests (id, udid, device_name, model, system_version, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?) ON CONFLICT(udid) DO NOTHING")
+    .bind(crypto.randomUUID(), udid, deviceName, model, systemVersion, now, now).run()
+  const row = await env.DB.prepare("SELECT id, status FROM requests WHERE udid = ?").bind(udid).first()
+  if (row.status === "declined" || row.status === "removed") {
+    await env.DB.prepare("UPDATE requests SET status = 'pending', device_name = ?, model = ?, system_version = ?, updated_at = ? WHERE id = ?")
+      .bind(deviceName, model, systemVersion, now, row.id).run()
+  }
+  return Response.redirect(`${new URL(request.url).origin}/?request=${row.id}`, 301)
 }
 
 async function requestStatus(id, env) {
@@ -55,7 +59,11 @@ async function requestStatus(id, env) {
   if (!row) {
     return json({ status: "unknown" }, 404)
   }
-  return json({ status: row.status, install: row.status === "ready" ? env.INSTALL_LINK : null }, 200)
+  if (row.status !== "ready") {
+    return json({ status: row.status, install: null }, 200)
+  }
+  const setting = await env.DB.prepare("SELECT value FROM settings WHERE key = 'install'").first()
+  return json({ status: row.status, install: setting ? setting.value : env.INSTALL_LINK }, 200)
 }
 
 async function administer(request, env, path) {
@@ -75,11 +83,20 @@ async function administer(request, env, path) {
     const result = await env.DB.prepare("UPDATE requests SET status = ?, updated_at = ? WHERE id = ?").bind(status, new Date().toISOString(), match[1]).run()
     return json({ updated: result.meta.changes }, result.meta.changes === 1 ? 200 : 404)
   }
+  if (request.method === "POST" && path === "/admin/install") {
+    const { link } = await request.json()
+    if (typeof link !== "string" || !link.startsWith("itms-services://?action=download-manifest&url=https://")) {
+      return json({ error: "invalid install link" }, 400)
+    }
+    await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('install', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bind(link).run()
+    return json({ updated: 1 }, 200)
+  }
   return json({ error: "not found" }, 404)
 }
 
 function page(env) {
   const owner = JSON.stringify(env.OWNER_NAME).replaceAll("<", "\\u003c")
+  const minimum = JSON.stringify(env.MINIMUM_SYSTEM || "").replaceAll("<", "\\u003c")
   const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -107,6 +124,8 @@ function page(env) {
 </main>
 <script>
   const owner = ${owner}
+  const minimum = ${minimum}
+  const requirement = minimum ? " AppShelf needs iOS " + minimum + " or later." : ""
   const message = document.getElementById("message")
   const action = document.getElementById("action")
   const note = document.getElementById("note")
@@ -133,8 +152,18 @@ function page(env) {
     }
   }
 
+  const agent = navigator.userAgent
+  const onDevice = /iPhone|iPad|iPod/.test(agent) || (/Macintosh/.test(agent) && navigator.maxTouchPoints > 1)
+  const inSafari = onDevice && !/CriOS|FxiOS|EdgiOS|OPiOS|GSA|FBAN|FBAV|Instagram/.test(agent)
+
   function offerRequest() {
-    show("Get " + owner + "'s apps on this iPhone.", "Tap Request access, then Allow. Open Settings, tap Profile Downloaded, and install it. It only shares this iPhone's device ID with " + owner + " and removes itself right away.", "/request.mobileconfig", "Request access")
+    if (!onDevice) {
+      show("Open this link on your iPhone.", "AppShelf installs " + owner + "'s apps on the iPhone that opens this page.")
+    } else if (!inSafari) {
+      show("Open this link in Safari.", "Copy the link and paste it into Safari. Other browsers cannot request access or install apps.")
+    } else {
+      show("Get " + owner + "'s apps on this iPhone.", "Tap Request access, then Allow. Open Settings, tap Profile Downloaded, and install it. It only shares this iPhone's device ID with " + owner + " and removes itself right away." + requirement, "/request.mobileconfig", "Request access")
+    }
   }
 
   async function refresh() {
