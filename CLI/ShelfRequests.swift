@@ -329,7 +329,7 @@ func setupShelfRequests(template: URL) throws {
         try files.copyItem(at: template.appendingPathComponent("CLI/ShelfRequests/\(file)"), to: destination)
     }
     guard !(try wrangler(["whoami"], directory: directory)).localizedCaseInsensitiveContains("not authenticated") else {
-        throw RequiredAction(result: "needs-cloudflare-login", message: "Sign in to the free Cloudflare account in the browser, then rerun setup-shelf-requests.", command: "npx wrangler@4.143.0 login")
+        throw RequiredAction(result: "needs-cloudflare-login", message: "Sign in to the free Cloudflare account in the browser, then rerun setup-shelf-requests.", command: "npm_config_cache=$HOME/Library/Caches/uikit-app/npm npx --yes wrangler@4.143.0 login")
     }
     struct Database: Decodable {
         let uuid: String
