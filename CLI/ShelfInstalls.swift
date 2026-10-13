@@ -105,7 +105,7 @@ func shelfInstallPackage(_ application: ShelfApplication, store: ShelfStore, cac
     return path
 }
 
-func verifyShelfInstall(_ path: URL, application: ShelfApplication, deviceUDID: String) throws {
+func verifyShelfInstall(_ path: URL, application: ShelfApplication, devices: [String]) throws {
     let information = try PropertyListSerialization.propertyList(from: Data(contentsOf: path.appendingPathComponent("Info.plist")), format: nil) as? [String: Any]
     guard information?["CFBundleIdentifier"] as? String == application.bundleIdentifier,
           information?["CFBundleShortVersionString"] as? String == application.version,
@@ -121,7 +121,7 @@ func verifyShelfInstall(_ path: URL, application: ShelfApplication, deviceUDID: 
     guard let profile = try PropertyListSerialization.propertyList(from: Data(decoded.utf8), format: nil) as? [String: Any] else {
         throw CommandError(message: "Cannot read the shelf package's provisioning profile.")
     }
-    _ = try verifyDirectProfile(profile, bundle: application.bundleIdentifier, deviceUDID: deviceUDID)
+    _ = try verifyDirectProfile(profile, bundle: application.bundleIdentifier, devices: devices)
 }
 
 func installShelfApplications(_ catalog: ShelfCatalog, store: ShelfStore) {
@@ -137,6 +137,7 @@ func installShelfApplications(_ catalog: ShelfCatalog, store: ShelfStore) {
         guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
             return
         }
+        let devices = try ShelfDevices.load()
         var installed = try shelfInstalledApps(deviceUDID: configuration.deviceUDID)
         let cache = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/ShelfInstalls")
         try files.createDirectory(at: cache, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -161,7 +162,7 @@ func installShelfApplications(_ catalog: ShelfCatalog, store: ShelfStore) {
                 guard applications.count == 1, let path = applications.first else {
                     throw CommandError(message: "Expected one application in the shelf package.")
                 }
-                try verifyShelfInstall(path, application: application, deviceUDID: configuration.deviceUDID)
+                try verifyShelfInstall(path, application: application, devices: devices.udids)
                 installed = try shelfInstalledApps(deviceUDID: configuration.deviceUDID)
                 guard try installed.needsInstall(application) else {
                     continue

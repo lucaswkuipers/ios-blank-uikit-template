@@ -17,6 +17,8 @@ This Mac defaults to AppShelf. `publish` pushes and waits for that commit's work
 
 Only personal team `AR7T5G5Z83` and private personal repos. Never use amo or commit credentials. Preserve existing icons and honor framework/delivery overrides. `--local-only` skips GitHub and delivery setup. Simulator verification is optional: `uikit-app check <directory>`; review its screenshot and relevant behavior.
 
+To share the shelf with someone, get their iPhone's UDID and run `uikit-app share-shelf --device <UDID> --name <device-name>`; it re-signs every shelf app for that iPhone and prints an AppShelf invite link and QR code. New apps include shared iPhones automatically. Details: [AppShelf](references/direct-shelf.md#sharing-the-shelf).
+
 For requested TestFlight, create with `--delivery testflight`, or manually run `uikit-app testflight <existing-directory>`. Existing apps retain their route. Never enable two push workflows. Declare actual encryption use before TestFlight upload. `available-to-internal-tester` confirms that route.
 
 Read recovery details only when needed: [AppShelf](references/direct-shelf.md), [TestFlight/login](references/testflight-setup.md). `setup-repo` repairs repository/runner setup. Remote device control, external testing, and App Store submission require separate requests.

@@ -17,6 +17,8 @@ struct ShelfApplication: Codable {
     var installExpiration: Date?
     var iconPNG: String?
     var notificationTitle: String?
+    var deviceSet: String?
+    var silent: Bool?
 }
 
 struct ShelfCatalog: Codable {
@@ -249,6 +251,7 @@ func deliverDirect(directory: String) throws {
     defer { close(descriptor) }
     guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else { throw CommandError(message: "Another delivery is already running for this app.") }
     let store = try ShelfStore()
+    let devices = try ShelfDevices.load()
     _ = try store.github.repository(name: metadata.name)
     try verifyPersonalRemote(store.github.git(root, ["remote", "get-url", "origin"], remote: false), name: metadata.name)
     guard try store.github.git(root, ["status", "--porcelain"], remote: false).isEmpty else {
@@ -256,7 +259,7 @@ func deliverDirect(directory: String) throws {
     }
     let commit = try store.github.git(root, ["rev-parse", "HEAD"], remote: false)
     let (_, previous) = try store.catalog()
-    if let application = previous.applications.first(where: { $0.bundleIdentifier == metadata.bundleIdentifier && $0.sourceCommit == commit }), application.profileExpiration > Date().addingTimeInterval(86400) {
+    if let application = previous.applications.first(where: { $0.bundleIdentifier == metadata.bundleIdentifier && $0.sourceCommit == commit }), application.profileExpiration > Date().addingTimeInterval(86400), devices.isCurrent(application) {
         _ = try withShelfLock { try store.refresh() }
         try emit(["result": "available-in-shelf", "app": metadata.name, "build": application.build, "team": TestFlightConfiguration.personalTeam, "sourcesChanged": "false"])
         return
@@ -307,7 +310,9 @@ func deliverDirect(directory: String) throws {
         guard asset.size == package.size, asset.digest == "sha256:\(package.sha256)" else {
             throw CommandError(message: "GitHub's uploaded package size or checksum differs. The release remains a draft.")
         }
-        application = ShelfApplication(name: package.name, bundleIdentifier: package.bundleIdentifier, version: package.version, build: package.build, minimumOSVersion: package.minimumOSVersion, profileExpiration: package.profileExpiration, sourceCommit: commit, sha256: package.sha256, size: package.size, packageAssetID: asset.id, publishedAt: Date(), manifestAssetID: nil, installExpiration: nil, iconPNG: try shelfIcon(root: root, name: metadata.name), notificationTitle: previous.applications.contains(where: { $0.bundleIdentifier == metadata.bundleIdentifier }) ? "Update available" : "New app available")
+        let previousApplication = previous.applications.first(where: { $0.bundleIdentifier == metadata.bundleIdentifier })
+        let resignedForDevices = previousApplication.map { $0.sourceCommit == commit && !devices.isCurrent($0) } ?? false
+        application = ShelfApplication(name: package.name, bundleIdentifier: package.bundleIdentifier, version: package.version, build: package.build, minimumOSVersion: package.minimumOSVersion, profileExpiration: package.profileExpiration, sourceCommit: commit, sha256: package.sha256, size: package.size, packageAssetID: asset.id, publishedAt: Date(), manifestAssetID: nil, installExpiration: nil, iconPNG: try shelfIcon(root: root, name: metadata.name), notificationTitle: previousApplication == nil ? "New app available" : "Update available", deviceSet: package.devices, silent: resignedForDevices)
         try store.updateBody(application, releaseID: artifactRelease.id)
         let request = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? files.removeItem(at: request) }

@@ -99,7 +99,7 @@ func publishShelfNotifications(_ catalog: ShelfCatalog) throws {
     defer { session.invalidateAndCancel() }
     let publisher = try ShelfNotificationPublisher(configuration: configuration, session: session)
     var failures: [String] = []
-    for application in catalog.applications where application.publishedAt >= configuration.enabledAt {
+    for application in catalog.applications where application.publishedAt >= configuration.enabledAt && application.silent != true {
         let announcement = ShelfAnnouncement(application: application)
         guard sent[application.bundleIdentifier] != announcement.recordName else { continue }
         guard application.profileExpiration > Date(), let expiration = application.installExpiration,

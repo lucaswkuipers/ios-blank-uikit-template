@@ -40,9 +40,17 @@ Each delivery route performs one signed Release archive. Simulator startup is op
 
 ## Private AppShelf delivery
 
-The shelf workflow runs `uikit-app direct <directory>`. It signs an Ad Hoc build for the configured personal iPhone and publishes immutable artifacts to private `lucaswkuipers/AppShelf-builds`. The phone app reads that repository with a separate read-only token, validates a temporary installation manifest, and opens the iOS installer. Lucas confirms installation on the phone. There is no TestFlight processing wait and no paid hosting service.
+The shelf workflow runs `uikit-app direct <directory>`. It signs an Ad Hoc build for the configured personal iPhone, plus any iPhones shared with `uikit-app share-shelf`, and publishes immutable artifacts to private `lucaswkuipers/AppShelf-builds`. The phone app reads that repository with a separate read-only token, validates a temporary installation manifest, and opens the iOS installer. Lucas confirms installation on the phone. There is no TestFlight processing wait and no paid hosting service.
 
 The Mac's `uikit-app refresh-shelf` LaunchAgent keeps temporary GitHub install links valid. `uikit-app setup-shelf-installs` also enables automatic installation of missing apps and updates on the configured, paired personal iPhone whenever CoreDevice can reach it. Each minute, the Mac compares actual installed versions with the catalog, reuses signed packages, and installs without launching apps. Unavailable devices and failed installs are retried on later refreshes. Keep the Mac awake; already installed apps run independently until their signing expires. `available-in-shelf` means catalog availability; `installed-on-device` confirms the version was read back from the phone. See [direct shelf setup and recovery](AgentSkill/uikit-app/references/direct-shelf.md).
+
+## Sharing the shelf
+
+```bash
+uikit-app share-shelf --device <their-iPhone-UDID> --name "Alex's iPhone"
+```
+
+Registers another iPhone with the personal team, re-signs every shelf app for it through each app's own workflow (AppShelf first, without notifications), then prints an AppShelf install link and QR code. The invite lives in a secret gist; the iPhone Camera opens the QR directly. The other person then installs apps from their own AppShelf and receives the same CloudKit notifications on their iCloud account. Apple allows 100 iPhones per membership year; nothing else costs money. Rerun without options to retry or reprint the invite. See [sharing](AgentSkill/uikit-app/references/direct-shelf.md#sharing-the-shelf).
 
 ## Private TestFlight delivery
 

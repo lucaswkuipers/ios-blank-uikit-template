@@ -44,5 +44,5 @@ func testShelfInstalls(directory: URL) throws {
     let bundle = directory.appendingPathComponent("Test.app")
     try files.createDirectory(at: bundle, withIntermediateDirectories: true)
     try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": "com.lucaswkuipers.Other", "CFBundleVersion": "10", "CFBundleShortVersionString": "2.0"], format: .xml, options: 0).write(to: bundle.appendingPathComponent("Info.plist"))
-    try expectFailure { try verifyShelfInstall(bundle, application: application, deviceUDID: "personal-iphone") }
+    try expectFailure { try verifyShelfInstall(bundle, application: application, devices: ["personal-iphone"]) }
 }

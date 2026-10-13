@@ -103,20 +103,20 @@ func setupDirect(options: Options) throws {
     try emit(["result": "personal-direct-signing-ready", "team": TestFlightConfiguration.personalTeam, "device": deviceName])
 }
 
-func verifyDirectProfile(_ profile: [String: Any], bundle: String, deviceUDID: String) throws -> Date {
+func verifyDirectProfile(_ profile: [String: Any], bundle: String, devices: [String]) throws -> Date {
     guard profile["TeamIdentifier"] as? [String] == [TestFlightConfiguration.personalTeam],
-          profile["ProvisionedDevices"] as? [String] == [deviceUDID],
+          let provisioned = profile["ProvisionedDevices"] as? [String], provisioned.count == devices.count, Set(provisioned) == Set(devices),
           profile["ProvisionsAllDevices"] as? Bool != true,
           let entitlements = profile["Entitlements"] as? [String: Any],
           entitlements["application-identifier"] as? String == "\(TestFlightConfiguration.personalTeam).\(bundle)",
           entitlements["get-task-allow"] as? Bool == false,
           let expiration = profile["ExpirationDate"] as? Date, expiration > Date().addingTimeInterval(86400) else {
-        throw CommandError(message: "Direct distribution requires an unexpired personal Ad Hoc profile containing only the configured iPhone.")
+        throw CommandError(message: "Direct distribution requires an unexpired personal Ad Hoc profile containing exactly the shelf's iPhones.")
     }
     return expiration
 }
 
-func directProfile(client: AppStoreClient, configuration: DirectConfiguration, metadata: Project, cache: URL, capabilityRevision: String) throws -> String {
+func directProfile(client: AppStoreClient, configuration: DirectConfiguration, devices: ShelfDevices, metadata: Project, cache: URL, capabilityRevision: String) throws -> String {
     let bundles = try client.list("/v1/bundleIds", query: ["filter[identifier]": metadata.bundleIdentifier])
     let bundle: AppleResource
     if let existing = bundles.first {
@@ -127,7 +127,7 @@ func directProfile(client: AppStoreClient, configuration: DirectConfiguration, m
     } else {
         bundle = try client.create(type: "bundleIds", attributes: ["identifier": metadata.bundleIdentifier, "name": metadata.name, "platform": "IOS"], relationships: [:])
     }
-    let profileName = "UIKit App \(metadata.bundleIdentifier) \(configuration.deviceID) \(configuration.certificateID)\(capabilityRevision)"
+    let profileName = "UIKit App \(metadata.bundleIdentifier) \(devices.identifier) \(configuration.certificateID)\(capabilityRevision)"
     let profiles = try client.list("/v1/profiles", query: ["filter[name]": profileName, "filter[profileType]": "IOS_APP_ADHOC", "filter[profileState]": "ACTIVE"])
     let profile: AppleResource
     if let existing = profiles.first {
@@ -136,7 +136,7 @@ func directProfile(client: AppStoreClient, configuration: DirectConfiguration, m
         profile = try client.create(type: "profiles", attributes: ["name": profileName, "profileType": "IOS_APP_ADHOC"], relationships: [
             "bundleId": ["data": ["type": "bundleIds", "id": bundle.id]],
             "certificates": ["data": [["type": "certificates", "id": configuration.certificateID]]],
-            "devices": ["data": [["type": "devices", "id": configuration.deviceID]]]
+            "devices": ["data": devices.deviceIDs.map { ["type": "devices", "id": $0] }]
         ])
     }
     guard let content = profile.string("profileContent"), let data = Data(base64Encoded: content) else {
@@ -148,7 +148,7 @@ func directProfile(client: AppStoreClient, configuration: DirectConfiguration, m
     guard let values = try PropertyListSerialization.propertyList(from: Data(decoded.utf8), format: nil) as? [String: Any], let uuid = values["UUID"] as? String else {
         throw CommandError(message: "Cannot decode the direct-distribution profile.")
     }
-    _ = try verifyDirectProfile(values, bundle: metadata.bundleIdentifier, deviceUDID: configuration.deviceUDID)
+    _ = try verifyDirectProfile(values, bundle: metadata.bundleIdentifier, devices: devices.udids)
     let installed = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Developer/Xcode/UserData/Provisioning Profiles")
     try files.createDirectory(at: installed, withIntermediateDirectories: true)
     try data.write(to: installed.appendingPathComponent("\(uuid).mobileprovision"), options: .atomic)
@@ -166,6 +166,7 @@ struct DirectPackage: Codable {
     let path: String
     let sha256: String
     let size: Int
+    let devices: String
 }
 
 func packageDirect(directory: String, build: String) throws -> DirectPackage {
@@ -177,10 +178,11 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
         throw CommandError(message: "Direct distribution is restricted to personal apps.")
     }
     let configuration = try DirectConfiguration.load()
+    let devices = ShelfDevices(configuration: configuration, sharing: try ShelfSharing.load())
     let client = try AppStoreClient(configuration: TestFlightConfiguration.load())
     try client.verifyPersonalAccount()
     let fingerprint = try sourceFingerprint(root)
-    let cache = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/Direct/\(metadata.name)/\(configuration.certificateID)-\(configuration.deviceID)/\(fingerprint.prefix(16))-\(build)")
+    let cache = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/Direct/\(metadata.name)/\(configuration.certificateID)-\(devices.identifier)/\(fingerprint.prefix(16))-\(build)")
     try files.createDirectory(at: cache, withIntermediateDirectories: true)
     let descriptor = open(cache.appendingPathComponent("package.lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
     guard descriptor >= 0 else { throw CommandError(message: "Cannot open package lock.") }
@@ -216,10 +218,10 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
     } else {
         capabilityRevision = ""
     }
-    let profile = try directProfile(client: client, configuration: configuration, metadata: metadata, cache: cache, capabilityRevision: capabilityRevision)
+    let profile = try directProfile(client: client, configuration: configuration, devices: devices, metadata: metadata, cache: cache, capabilityRevision: capabilityRevision)
     let archive = cache.appendingPathComponent("Direct.xcarchive")
     if files.fileExists(atPath: archive.path) { try files.removeItem(at: archive) }
-    status("Archiving \(metadata.name) build \(build) for the personal iPhone…")
+    status("Archiving \(metadata.name) build \(build) for \(devices.udids.count) shelf iPhones…")
     try run("/usr/bin/xcodebuild", projectArguments + ["-destination", "generic/platform=iOS", "-derivedDataPath", cache.deletingLastPathComponent().appendingPathComponent("DerivedData").path, "-archivePath", archive.path, "-quiet", "archive", "CURRENT_PROJECT_VERSION=\(build)", "DEVELOPMENT_TEAM=\(TestFlightConfiguration.personalTeam)", "CODE_SIGN_STYLE=Manual", "CODE_SIGN_IDENTITY=\(configuration.certificateSHA1)", "PROVISIONING_PROFILE_SPECIFIER=\(profile)"], log: cache.appendingPathComponent("archive.log"))
     guard try sourceFingerprint(root) == fingerprint else {
         throw CommandError(message: "Sources changed during the archive. Finish edits and rerun; no package was published.")
@@ -258,9 +260,9 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
             throw CommandError(message: "Export changed the app's CloudKit or push environment.")
         }
     }
-    let expiration = try verifyDirectProfile(profileValues, bundle: metadata.bundleIdentifier, deviceUDID: configuration.deviceUDID)
+    let expiration = try verifyDirectProfile(profileValues, bundle: metadata.bundleIdentifier, devices: devices.udids)
     let data = try Data(contentsOf: package, options: .mappedIfSafe)
-    let result = DirectPackage(name: information["CFBundleDisplayName"] as? String ?? metadata.name, bundleIdentifier: metadata.bundleIdentifier, version: version, build: build, minimumOSVersion: minimumOSVersion, profileExpiration: expiration, fingerprint: fingerprint, path: package.path, sha256: SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(), size: data.count)
+    let result = DirectPackage(name: information["CFBundleDisplayName"] as? String ?? metadata.name, bundleIdentifier: metadata.bundleIdentifier, version: version, build: build, minimumOSVersion: minimumOSVersion, profileExpiration: expiration, fingerprint: fingerprint, path: package.path, sha256: SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(), size: data.count, devices: devices.identifier)
     try JSONEncoder().encode(result).write(to: state, options: .atomic)
     return result
 }
