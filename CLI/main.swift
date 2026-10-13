@@ -186,7 +186,7 @@ do {
         uikit-app refresh-shelf
         uikit-app setup-shelf-refresh
         uikit-app setup-shelf-installs
-        uikit-app share-shelf [--device <iPhone-UDID> --name <device-name>]
+        uikit-app share-shelf [--device <iPhone-UDID> --name <device-name> | --remove <device-name-or-UDID>]
         uikit-app setup-testflight --key <file.p8> --key-id <ID> --issuer <UUID> --tester <email> --account-bundle <existing-personal-bundle-ID>
 
         Creates from the programmatic UIKit template and integrates an Icon Studio icon.
@@ -201,8 +201,8 @@ do {
         uploads, and waits for internal availability. No browser or simulator is required.
         check is optional for simulator/behavior verification; it is not needed before testflight.
         login performs the occasional Apple CLI password/2FA sign-in in Terminal.
-        share-shelf adds another iPhone to every shelf app's signing, re-signs the shelf apps,
-        and prints an AppShelf install link and QR code. Without options, it resumes and reprints them.
+        share-shelf approves another iPhone for every shelf app, or removes one, re-signs the shelf apps,
+        and prints the AppShelf install link and QR code. Without options, it resumes and reprints them.
         Personal defaults: ~/.config/uikit-app/config.json (team, bundlePrefix, and delivery).
         """)
     } else if arguments == ["login"] {
@@ -214,7 +214,7 @@ do {
     } else if arguments == ["setup-shelf-installs"] {
         try setupShelfInstalls()
     } else if arguments.first == "share-shelf" {
-        try shareShelf(options: Options(arguments.dropFirst(), allowed: ["--device", "--name"]))
+        try shareShelf(options: Options(arguments.dropFirst(), allowed: ["--device", "--name", "--remove"]))
     } else {
         guard arguments.count >= 2 else { throw CommandError(message: "Use uikit-app --help") }
         switch arguments[0] {

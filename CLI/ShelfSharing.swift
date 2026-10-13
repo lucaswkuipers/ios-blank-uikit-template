@@ -62,17 +62,20 @@ struct ShelfInvite {
 func shareShelf(options: Options) throws {
     let udid = options.values["--device"]
     let name = options.values["--name"]
-    guard (udid == nil) == (name == nil) else {
-        throw CommandError(message: "Provide both --device <iPhone-UDID> and --name <device-name>, or neither to resume sharing.")
-    }
-    if let udid, let name {
+    let removal = options.values["--remove"]
+    if let udid, let name, removal == nil {
         try addShelfDevice(udid: udid, name: name)
+    } else if let removal, udid == nil, name == nil {
+        try removeShelfDevice(removal)
+    } else if udid != nil || name != nil || removal != nil {
+        throw CommandError(message: "Use --device <iPhone-UDID> --name <device-name> to approve an iPhone, --remove <device-name-or-UDID> to remove one, or no options to resume sharing.")
     }
     let store = try ShelfStore()
     let devices = try ShelfDevices.load()
     let failures = try resignShelfApplications(store: store, devices: devices)
     let invite = try publishShelfInvite(store: store, devices: devices)
-    try emit(["result": "shelf-shared", "iPhones": String(devices.udids.count), "invite": invite.link, "qrCode": invite.qrCode.path, "pendingApps": String(failures.count)])
+    let shared = try ShelfSharing.load().devices.map(\.name).joined(separator: ", ")
+    try emit(["result": "shelf-shared", "sharedWith": shared, "invite": invite.link, "qrCode": invite.qrCode.path, "pendingApps": String(failures.count)])
     guard failures.isEmpty else {
         throw CommandError(message: "The invite works, but some apps are not yet signed for every shelf iPhone. Rerun uikit-app share-shelf to retry them:\n" + failures.joined(separator: "\n"))
     }
@@ -107,6 +110,18 @@ func addShelfDevice(udid: String, name: String) throws {
     }
     sharing.devices.append(ShelfSharedDevice(id: device.id, udid: registered, name: name))
     try sharing.save()
+}
+
+func removeShelfDevice(_ identifier: String) throws {
+    var sharing = try ShelfSharing.load()
+    let matches = sharing.devices.filter { $0.udid.caseInsensitiveCompare(identifier) == .orderedSame || $0.name == identifier }
+    guard let device = matches.first, matches.count == 1 else {
+        let names = sharing.devices.map(\.name).joined(separator: ", ")
+        throw CommandError(message: matches.isEmpty ? "No shared iPhone matches \(identifier). Shared iPhones: \(names.isEmpty ? "none" : names)." : "Several shared iPhones are named \(identifier). Remove one by its UDID.")
+    }
+    sharing.devices.removeAll { $0.id == device.id }
+    try sharing.save()
+    status("Removed \(device.name). Re-signing every shelf app without it…")
 }
 
 func resignShelfApplications(store: ShelfStore, devices: ShelfDevices) throws -> [String] {

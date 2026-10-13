@@ -50,7 +50,7 @@ The Mac's `uikit-app refresh-shelf` LaunchAgent keeps temporary GitHub install l
 uikit-app share-shelf --device <their-iPhone-UDID> --name "Alex's iPhone"
 ```
 
-Registers another iPhone with the personal team, re-signs every shelf app for it through each app's own workflow (AppShelf first, without notifications), then prints an AppShelf install link and QR code. The invite lives in a secret gist; the iPhone Camera opens the QR directly. The other person then installs apps from their own AppShelf and receives the same CloudKit notifications on their iCloud account. Apple allows 100 iPhones per membership year; nothing else costs money. Rerun without options to retry or reprint the invite. See [sharing](AgentSkill/uikit-app/references/direct-shelf.md#sharing-the-shelf).
+Registers another iPhone with the personal team, re-signs every shelf app for it through each app's own workflow (AppShelf first, without notifications), then prints an AppShelf install link and QR code. The invite lives in a secret gist; the iPhone Camera opens the QR directly. The other person then installs apps from their own AppShelf and receives the same CloudKit notifications on their iCloud account. Apple allows 100 iPhones per membership year; nothing else costs money. Rerun without options to retry or reprint the invite. `uikit-app share-shelf --remove "Alex's iPhone"` revokes an iPhone: it can no longer install or update anything, though apps already on it run until their signing expires. See [sharing](AgentSkill/uikit-app/references/direct-shelf.md#sharing-the-shelf).
 
 ## Private TestFlight delivery
 
