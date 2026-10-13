@@ -213,7 +213,7 @@ func publishShelfInvite(store: ShelfStore, devices: ShelfDevices) throws -> Shel
     let manifestData = try PropertyListSerialization.data(fromPropertyList: manifest, format: .xml, options: 0)
     try manifestData.write(to: checkout.appendingPathComponent("AppShelf.plist"), options: .atomic)
     try readme.write(to: checkout.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
-    let manifestURL = "\(raw)/\(try store.github.git(checkout, ["hash-object", "AppShelf.plist"], remote: false))/AppShelf.plist"
+    let manifestURL = "\(raw)/AppShelf.plist"
     if try !store.github.git(checkout, ["status", "--porcelain"], remote: false).isEmpty {
         try store.github.git(checkout, ["add", "--all"], remote: false)
         try store.github.git(checkout, ["-c", "user.name=Lucas Werner Kuipers", "-c", "user.email=lucaswkuipers@gmail.com", "commit", "--quiet", "-m", "AppShelf \(application.version) (\(application.build))"], remote: false)
@@ -237,19 +237,24 @@ func publishShelfInvite(store: ShelfStore, devices: ShelfDevices) throws -> Shel
 
 func verifyPublicDownload(_ url: String, expected: Data, directory: URL) throws {
     let download = directory.appendingPathComponent(UUID().uuidString)
-    for _ in 0..<6 {
+    let deadline = Date().addingTimeInterval(420)
+    var waiting = false
+    while Date() < deadline {
         do {
             try run("/usr/bin/curl", ["--fail", "--silent", "--show-error", "--max-time", "60", "--output", download.path, url], log: nil)
             if try Data(contentsOf: download) == expected {
                 return
             }
-            status("GitHub is still serving older content for \(url)…")
         } catch {
-            status("Waiting for GitHub to serve \(url): \(error.localizedDescription)")
+            status("Could not download \(url): \(error.localizedDescription)")
         }
-        Thread.sleep(forTimeInterval: 5)
+        if !waiting {
+            status("Waiting for GitHub's cache to serve the updated \(url); this can take five minutes…")
+            waiting = true
+        }
+        Thread.sleep(forTimeInterval: 10)
     }
-    throw CommandError(message: "The invite file at \(url) does not match the published AppShelf build.")
+    throw CommandError(message: "GitHub still does not serve the published AppShelf invite at \(url).")
 }
 
 func writeQRCode(_ text: String, to destination: URL) throws {
