@@ -33,7 +33,7 @@ func appleRequest(_ request: URLRequest, session: URLSession = .shared) throws -
             let detail = errors.prefix(3).map { error in
                 ["code", "title", "detail"].compactMap { error[$0] as? String }.joined(separator: ": ")
             }.joined(separator: "\n")
-            throw AppleHTTPError(status: response.statusCode, message: "Apple \(request.httpMethod ?? "GET") \(request.url?.path ?? ""): HTTP \(response.statusCode)\n\(detail.prefix(1800))")
+            throw AppleHTTPError(status: response.statusCode, message: "\(request.url?.host ?? "Server") \(request.httpMethod ?? "GET") \(request.url?.path ?? ""): HTTP \(response.statusCode)\n\(detail.prefix(1800))")
         } catch let error as URLError where request.httpMethod == "GET" && attempt < 2 && [.timedOut, .networkConnectionLost, .cannotConnectToHost, .notConnectedToInternet].contains(error.code) {
             Thread.sleep(forTimeInterval: Double(2 << attempt))
         }

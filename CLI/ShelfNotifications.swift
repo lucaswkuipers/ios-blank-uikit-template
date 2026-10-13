@@ -80,7 +80,7 @@ struct ShelfNotificationPublisher {
         }
     }
 
-    private func records(operation: String, body: [String: Any]) throws -> [[String: Any]] {
+    func records(operation: String, body: [String: Any]) throws -> [[String: Any]] {
         let request = try request(operation: operation, body: body, date: Date())
         let data = try appleRequest(request, session: session)
         guard let response = try JSONSerialization.jsonObject(with: data) as? [String: Any],

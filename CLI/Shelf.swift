@@ -24,6 +24,7 @@ struct ShelfApplication: Codable {
 struct ShelfCatalog: Codable {
     let schema: Int
     var applications: [ShelfApplication]
+    var invitation: String?
 }
 
 struct ShelfDeliveryState: Codable {
@@ -212,6 +213,7 @@ func refreshShelf() throws {
     let store = try ShelfStore()
     let catalog = try withShelfLock { try store.refresh() }
     try emit(["result": "shelf-links-refreshed", "apps": String(catalog.applications.count)])
+    processShelfRequests()
     installShelfApplications(catalog, store: store)
 }
 

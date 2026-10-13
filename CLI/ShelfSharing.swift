@@ -52,6 +52,10 @@ struct ShelfDevices {
     func isCurrent(_ application: ShelfApplication) -> Bool {
         (application.deviceSet ?? ownerDeviceID) == identifier
     }
+
+    func includes(_ udid: String) -> Bool {
+        udids.contains { $0.caseInsensitiveCompare(udid) == .orderedSame }
+    }
 }
 
 struct ShelfInvite {
@@ -60,6 +64,8 @@ struct ShelfInvite {
 }
 
 func shareShelf(options: Options) throws {
+    let lock = try lockShelfShare()
+    defer { close(lock) }
     let udid = options.values["--device"]
     let name = options.values["--name"]
     let removal = options.values["--remove"]
@@ -72,8 +78,32 @@ func shareShelf(options: Options) throws {
     }
     let store = try ShelfStore()
     let devices = try ShelfDevices.load()
-    let failures = try resignShelfApplications(store: store, devices: devices)
-    let invite = try publishShelfInvite(store: store, devices: devices)
+    let session = URLSession(configuration: .ephemeral, delegate: RejectRedirect(), delegateQueue: nil)
+    defer { session.invalidateAndCancel() }
+    let requests = try ShelfRequests.load(session: session)
+    let invite: ShelfInvite
+    var failures: [String] = []
+    do {
+        let (_, catalog) = try store.catalog()
+        let outdated = catalog.applications.filter { !devices.isCurrent($0) }
+        if let shelf = outdated.first(where: { $0.bundleIdentifier == "com.lucaswkuipers.AppShelf" }) {
+            try resignShelfApplication(shelf, store: store, devices: devices)
+        }
+        invite = try publishShelfInvite(store: store, devices: devices)
+        try requests?.markReady(devices: devices)
+        for application in outdated where application.bundleIdentifier != "com.lucaswkuipers.AppShelf" {
+            do {
+                try resignShelfApplication(application, store: store, devices: devices)
+            } catch {
+                status("Could not re-sign \(application.name): \(error.localizedDescription)")
+                failures.append("\(application.name): \(error.localizedDescription)")
+            }
+        }
+        try requests?.finish(devices: devices, complete: failures.isEmpty)
+    } catch {
+        try requests?.fail(devices: devices)
+        throw error
+    }
     let shared = try ShelfSharing.load().devices.map(\.name).joined(separator: ", ")
     try emit(["result": "shelf-shared", "sharedWith": shared, "invite": invite.link, "qrCode": invite.qrCode.path, "pendingApps": String(failures.count)])
     guard failures.isEmpty else {
@@ -90,7 +120,7 @@ func addShelfDevice(udid: String, name: String) throws {
     var sharing = try ShelfSharing.load()
     let known = [configuration.deviceUDID] + sharing.devices.map(\.udid)
     guard !known.contains(where: { $0.caseInsensitiveCompare(udid) == .orderedSame }) else {
-        status("\(name) is already signed into every shelf app.")
+        status("\(name) is already approved for the shelf.")
         return
     }
     let client = try AppStoreClient(configuration: TestFlightConfiguration.load())
@@ -124,28 +154,16 @@ func removeShelfDevice(_ identifier: String) throws {
     status("Removed \(device.name). Re-signing every shelf app without it…")
 }
 
-func resignShelfApplications(store: ShelfStore, devices: ShelfDevices) throws -> [String] {
-    let (_, catalog) = try store.catalog()
-    let outdated = catalog.applications.filter { !devices.isCurrent($0) }
-    let ordered = outdated.filter { $0.bundleIdentifier == "com.lucaswkuipers.AppShelf" } + outdated.filter { $0.bundleIdentifier != "com.lucaswkuipers.AppShelf" }
-    var failures: [String] = []
-    for application in ordered {
-        do {
-            let asset = try store.decoder.decode(ShelfAsset.self, from: Data(store.github.call(["api", "repos/\(ShelfStore.repository)/releases/assets/\(application.packageAssetID)"]).utf8))
-            try validate(asset.name, pattern: "^[A-Za-z][A-Za-z0-9]*\\.ipa$", label: "shelf package name")
-            let repository = try store.github.repository(name: String(asset.name.dropLast(".ipa".count)))
-            status("Re-signing \(application.name) for \(devices.udids.count) iPhones…")
-            try runShelfWorkflow(repository: repository.nameWithOwner, github: store.github)
-            let (_, updated) = try store.catalog()
-            guard let resigned = updated.applications.first(where: { $0.bundleIdentifier == application.bundleIdentifier }), devices.isCurrent(resigned) else {
-                throw CommandError(message: "Its workflow succeeded without publishing a build for every shelf iPhone.")
-            }
-        } catch {
-            status("Could not re-sign \(application.name): \(error.localizedDescription)")
-            failures.append("\(application.name): \(error.localizedDescription)")
-        }
+func resignShelfApplication(_ application: ShelfApplication, store: ShelfStore, devices: ShelfDevices) throws {
+    let asset = try store.decoder.decode(ShelfAsset.self, from: Data(store.github.call(["api", "repos/\(ShelfStore.repository)/releases/assets/\(application.packageAssetID)"]).utf8))
+    try validate(asset.name, pattern: "^[A-Za-z][A-Za-z0-9]*\\.ipa$", label: "shelf package name")
+    let repository = try store.github.repository(name: String(asset.name.dropLast(".ipa".count)))
+    status("Re-signing \(application.name) for \(devices.udids.count) iPhones…")
+    try runShelfWorkflow(repository: repository.nameWithOwner, github: store.github)
+    let (_, updated) = try store.catalog()
+    guard let resigned = updated.applications.first(where: { $0.bundleIdentifier == application.bundleIdentifier }), devices.isCurrent(resigned) else {
+        throw CommandError(message: "Its workflow succeeded without publishing a build for every shelf iPhone.")
     }
-    return failures
 }
 
 func runShelfWorkflow(repository: String, github: PersonalGitHub) throws {

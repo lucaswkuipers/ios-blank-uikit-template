@@ -52,6 +52,8 @@ uikit-app share-shelf --device <their-iPhone-UDID> --name "Alex's iPhone"
 
 Registers another iPhone with the personal team, re-signs every shelf app for it through each app's own workflow (AppShelf first, without notifications), then prints an AppShelf install link and QR code. The invite lives in a secret gist; the iPhone Camera opens the QR directly. The other person then installs apps from their own AppShelf and receives the same CloudKit notifications on their iCloud account. Apple allows 100 iPhones per membership year; nothing else costs money. Rerun without options to retry or reprint the invite. `uikit-app share-shelf --remove "Alex's iPhone"` revokes an iPhone: it can no longer install or update anything, though apps already on it run until their signing expires. See [sharing](AgentSkill/uikit-app/references/direct-shelf.md#sharing-the-shelf).
 
+For self-service requests, run `uikit-app setup-shelf-requests` once (free Cloudflare account). Then share its link or QR code: people tap Request access, allow a one-time profile that sends their iPhone's ID, and AppShelf notifies you to approve or decline. Approval re-signs the shelf automatically, and their page turns into an Install AppShelf button. AppShelf's Sharing screen lists requests and shared iPhones and removes access.
+
 ## Private TestFlight delivery
 
 ```bash
