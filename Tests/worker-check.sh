@@ -92,9 +92,9 @@ check "admin lists the pending device" "$(printf '%s' "$listed" | grep -o "\"dev
 check "malformed admin bodies are rejected" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d 'not json' "$base/admin/requests/$id")" "400"
 check "invalid status" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d '{"status":"bogus"}' "$base/admin/requests/$id")" "400"
 check "ready status" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d '{"status":"ready"}' "$base/admin/requests/$id")" "200"
-check "ready falls back to the configured link" "$(curl -s "$base/status/$id")" "{\"status\":\"ready\",\"install\":\"${prefix}AppShelf.plist\"}"
+check "ready falls back to the configured link" "$(curl -s "$base/status/$id")" "{\"status\":\"ready\",\"install\":\"${prefix}AppShelf.plist\",\"request\":\"$id\"}"
 check "pinned link" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d "{\"link\":\"${prefix}abc/AppShelf.plist\"}" "$base/admin/install")" "200"
-check "ready uses the pinned link" "$(curl -s "$base/status/$id")" "{\"status\":\"ready\",\"install\":\"${prefix}abc/AppShelf.plist\"}"
+check "ready uses the pinned link" "$(curl -s "$base/status/$id")" "{\"status\":\"ready\",\"install\":\"${prefix}abc/AppShelf.plist\",\"request\":\"$id\"}"
 check "foreign links are rejected" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d '{"link":"itms-services://?action=download-manifest&url=https://evil.example/AppShelf.plist"}' "$base/admin/install")" "400"
 again="$(enroll alex)"
 check "an approved iPhone asking again needs a new approval" "$([[ "$again" == "$base/?request=$id" ]] && echo reused || echo new)" "new"
@@ -147,7 +147,8 @@ device iPhone16,1 00008130-000A1B2C3D4E5F71 other
 check "another iPhone with a used invite has to ask" "$(enroll other "$invite" | grep -o 'error=busy')" "error=busy"
 used="$(printf '%s' "$pending" | grep -o "{[^}]*\"invite\":\"$invite\"[^}]*}" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)"
 check "ready" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d '{"status":"ready"}' "$base/admin/requests/$used")" "200"
-check "a ready invite shows the install link" "$(curl -s "$base/invite/$invite")" "{\"status\":\"ready\",\"install\":\"${prefix}abc/AppShelf.plist\",\"name\":\"Sam\"}"
+check "a ready invite shows the install link" "$(curl -s "$base/invite/$invite")" "{\"status\":\"ready\",\"install\":\"${prefix}abc/AppShelf.plist\",\"request\":\"$used\",\"name\":\"Sam\"}"
+grep -q 'appshelf://joined?request=' "$work/page.js" || { printf 'FAIL: page cannot link AppShelf to the request\n'; exit 1; }
 removal="$(printf '{"token":"%s"}' "$invite")"
 check "used invites are kept" "$(curl -s "${admin[@]}" -d "$removal" "$base/admin/invites/remove")" '{"updated":0}'
 cancelled="$(openssl rand -hex 16)"

@@ -111,7 +111,7 @@ async function state(id, env) {
     return { status: row.status, install: null }
   }
   const setting = await env.DB.prepare("SELECT value FROM settings WHERE key = 'install'").first()
-  return { status: row.status, install: setting ? setting.value : env.INSTALL_LINK }
+  return { status: row.status, install: setting ? setting.value : env.INSTALL_LINK, request: id }
 }
 
 async function requestStatus(id, env) {
@@ -212,6 +212,7 @@ function page(env) {
   ol { margin: 20px 0 0; padding-left: 24px; text-align: left; }
   li { margin-top: 8px; }
   a { display: block; margin-top: 24px; padding: 16px; border-radius: 14px; background: var(--accent); color: #ffffff; font-weight: 600; text-decoration: none; }
+  a.secondary { margin-top: 12px; background: transparent; color: var(--accent); border: 2px solid var(--accent); }
   small { display: block; margin-top: 16px; color: var(--secondary); font-size: 15px; }
 </style>
 </head>
@@ -221,6 +222,7 @@ function page(env) {
   <p id="message"></p>
   <ol id="steps" hidden></ol>
   <a id="action" hidden></a>
+  <a id="opener" class="secondary" hidden>Open AppShelf</a>
   <small id="note"></small>
 </main>
 <script>
@@ -230,6 +232,7 @@ function page(env) {
   const message = document.getElementById("message")
   const steps = document.getElementById("steps")
   const action = document.getElementById("action")
+  const opener = document.getElementById("opener")
   const note = document.getElementById("note")
   const parameters = new URLSearchParams(location.search)
   const failure = parameters.get("error")
@@ -261,6 +264,7 @@ function page(env) {
       return
     }
     shown = next
+    opener.hidden = true
     message.textContent = text
     note.textContent = details
     action.hidden = !link
@@ -318,8 +322,12 @@ function page(env) {
     }
   }
 
-  function showReady(greeting, link) {
-    show(greeting + "This iPhone is ready.", "Tap Install AppShelf, then Install. Open AppShelf from your Home Screen, allow notifications, and install the apps you want." + (inSafari ? "" : " If nothing happens, open this page in Safari."), link, "Install AppShelf")
+  function showReady(greeting, link, request) {
+    show(greeting + "This iPhone is ready.", "Tap Install AppShelf, then Install. Open AppShelf from your Home Screen, allow notifications, and install the apps you want." + (inSafari ? "" : " If nothing happens, open this page in Safari.") + " Once it's installed, come back and tap Open AppShelf so " + owner + " can see which apps you use.", link, "Install AppShelf")
+    if (request) {
+      opener.href = "appshelf://joined?request=" + encodeURIComponent(request)
+      opener.hidden = false
+    }
   }
 
   function showUnsupported() {
@@ -356,7 +364,7 @@ function page(env) {
       schedule(30000)
       return
     case "ready":
-      showReady(greeting, state.install)
+      showReady(greeting, state.install, state.request)
       return
     case "declined":
     case "removed":
@@ -407,7 +415,7 @@ function page(env) {
       schedule(30000)
       return
     case "ready":
-      showReady("", state.install)
+      showReady("", state.install, state.request)
       return
     case "declined":
       forget()
