@@ -8,10 +8,12 @@ export npm_config_cache="$HOME/Library/Caches/uikit-app/npm" WRANGLER_SEND_METRI
 wrangler=(npx --yes wrangler@4.143.0)
 port=8791
 base="http://127.0.0.1:$port"
+token="$(openssl rand -hex 32)"
+prefix="itms-services://?action=download-manifest&url=https://gist.githubusercontent.com/lucaswkuipers/0123456789abcdef/raw/"
 
 cp "$repository/CLI/ShelfRequests/worker.js" "$repository/CLI/ShelfRequests/schema.sql" "$work/"
 printf 'profile fixture' > "$work/request.mobileconfig"
-cat > "$work/wrangler.toml" <<'EOF'
+cat > "$work/wrangler.toml" <<EOF
 name = "appshelf"
 main = "worker.js"
 compatibility_date = "2026-09-01"
@@ -21,7 +23,8 @@ rules = [{ type = "Data", globs = ["**/*.mobileconfig"], fallthrough = false }]
 
 [vars]
 OWNER_NAME = "Lucas"
-INSTALL_LINK = "itms-services://?action=download-manifest&url=https://example.com/raw/AppShelf.plist"
+INSTALL_LINK = "${prefix}AppShelf.plist"
+INSTALL_PREFIX = "$prefix"
 MINIMUM_SYSTEM = "27.0"
 
 [[d1_databases]]
@@ -29,7 +32,7 @@ binding = "DB"
 database_name = "appshelf-requests"
 database_id = "00000000-0000-0000-0000-000000000000"
 EOF
-printf 'ADMIN_TOKEN=worker-check-token\n' > "$work/.dev.vars"
+printf 'ADMIN_TOKEN=%s\n' "$token" > "$work/.dev.vars"
 cd "$work"
 "${wrangler[@]}" d1 execute appshelf-requests --local --file schema.sql --yes > /dev/null
 "${wrangler[@]}" dev --local --ip 127.0.0.1 --port "$port" > dev.log 2>&1 &
@@ -44,12 +47,12 @@ check() {
 }
 
 device() {
-    cat > "$work/device.plist" <<EOF
+    cat > "$work/device-$3.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0">
 <dict>
 	<key>DEVICE_NAME</key>
-	<string>Alex&apos;s iPhone</string>
+	<string>Alex&apos;s iPhone$(printf '\033')[2J</string>
 	<key>PRODUCT</key>
 	<string>$1</string>
 	<key>UDID</key>
@@ -59,41 +62,61 @@ device() {
 </dict>
 </plist>
 EOF
-    openssl smime -sign -binary -nodetach -outform der -signer "$work/device.pem" -inkey "$work/device.key" -in "$work/device.plist" -out "$work/device.p7s"
+    openssl smime -sign -binary -nodetach -outform der -signer "$work/device.pem" -inkey "$work/device.key" -in "$work/device-$3.plist" -out "$work/device-$3.p7s"
+}
+
+enroll() {
+    curl -s -o /dev/null -w '%{redirect_url}' -X POST --data-binary @"$work/device-$1.p7s" "$base/enroll"
 }
 
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work/device.key" -out "$work/device.pem" -subj "/CN=Device" -days 1 2> /dev/null
-admin=(-H "Authorization: Bearer worker-check-token")
+admin=(-H "Authorization: Bearer $token")
+
 check "page" "$(curl -s -o "$work/page.html" -w '%{http_code}' "$base/")" "200"
 /usr/bin/python3 -I -c 'import re, sys; sys.stdout.write(re.search(r"<script>(.*)</script>", open(sys.argv[1]).read(), re.S).group(1))' "$work/page.html" > "$work/page.js"
 node --check "$work/page.js"
+grep -q '\[hidden\] { display: none !important; }' "$work/page.html" || { printf 'FAIL: hidden buttons must not render\n'; exit 1; }
 grep -q 'AppShelf needs iOS " + minimum' "$work/page.js" || { printf 'FAIL: page script lost the iOS requirement\n'; exit 1; }
 check "profile type" "$(curl -s -o /dev/null -w '%{content_type}' "$base/request.mobileconfig")" "application/x-apple-aspen-config"
-device iPhone17,1 00008140-000A1B2C3D4E5F60
-location="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -X POST --data-binary @"$work/device.p7s" "$base/enroll")"
-check "enroll redirect" "${location%% *}" "301"
-id="${location##*request=}"
-check "repeat enroll keeps the request" "$(curl -s -o /dev/null -w '%{redirect_url}' -X POST --data-binary @"$work/device.p7s" "$base/enroll")" "$base/?request=$id"
+
+device iPhone17,1 00008140-000A1B2C3D4E5F60 alex
+first="$(enroll alex)"
+id="${first##*request=}"
+check "enroll redirects to the request" "$first" "$base/?request=$id"
+check "asking twice keeps one open request" "$(enroll alex)" "$base/?request=$id"
 check "pending status hides the link" "$(curl -s "$base/status/$id")" '{"status":"pending","install":null}'
 check "admin needs the token" "$(curl -s -o /dev/null -w '%{http_code}' "$base/admin/requests")" "401"
-check "admin lists the device" "$(curl -s "${admin[@]}" "$base/admin/requests" | grep -o "Alex's iPhone" | head -1)" "Alex's iPhone"
+check "admin rejects a guessed token" "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer undefined' "$base/admin/requests")" "401"
+listed="$(curl -s "${admin[@]}" "$base/admin/requests")"
+check "admin lists the pending device" "$(printf '%s' "$listed" | grep -o "\"deviceName\":\"Alex's iPhone\[2J\"" | head -1)" "\"deviceName\":\"Alex's iPhone[2J\""
+check "malformed admin bodies are rejected" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d 'not json' "$base/admin/requests/$id")" "400"
 check "invalid status" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d '{"status":"bogus"}' "$base/admin/requests/$id")" "400"
 check "ready status" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d '{"status":"ready"}' "$base/admin/requests/$id")" "200"
-check "ready falls back to the configured link" "$(curl -s "$base/status/$id")" '{"status":"ready","install":"itms-services://?action=download-manifest&url=https://example.com/raw/AppShelf.plist"}'
-check "pinned link" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d '{"link":"itms-services://?action=download-manifest&url=https://example.com/raw/abc/AppShelf.plist"}' "$base/admin/install")" "200"
-check "ready uses the pinned link" "$(curl -s "$base/status/$id")" '{"status":"ready","install":"itms-services://?action=download-manifest&url=https://example.com/raw/abc/AppShelf.plist"}'
-check "foreign links are rejected" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d '{"link":"https://evil.example"}' "$base/admin/install")" "400"
-check "declined" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d '{"status":"declined"}' "$base/admin/requests/$id")" "200"
-curl -s -o /dev/null -X POST --data-binary @"$work/device.p7s" "$base/enroll"
-check "a declined iPhone can ask again" "$(curl -s "$base/status/$id")" '{"status":"pending","install":null}'
-device MacBookPro18,1 00008112-000A1B2C3D4E5F61
-check "computers are rejected" "$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary @"$work/device.p7s" "$base/enroll")" "400"
-check "garbage is rejected" "$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary 'not a device' "$base/enroll")" "400"
-for index in $(seq 1 19); do
-    device iPhone17,1 "$(printf '00008140-%016X' "$index")"
-    curl -s -o /dev/null -X POST --data-binary @"$work/device.p7s" "$base/enroll"
+check "ready falls back to the configured link" "$(curl -s "$base/status/$id")" "{\"status\":\"ready\",\"install\":\"${prefix}AppShelf.plist\"}"
+check "pinned link" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d "{\"link\":\"${prefix}abc/AppShelf.plist\"}" "$base/admin/install")" "200"
+check "ready uses the pinned link" "$(curl -s "$base/status/$id")" "{\"status\":\"ready\",\"install\":\"${prefix}abc/AppShelf.plist\"}"
+check "foreign links are rejected" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d '{"link":"itms-services://?action=download-manifest&url=https://evil.example/AppShelf.plist"}' "$base/admin/install")" "400"
+again="$(enroll alex)"
+check "an approved iPhone asking again needs a new approval" "$([[ "$again" == "$base/?request=$id" ]] && echo reused || echo new)" "new"
+second="${again##*request=}"
+check "the new request starts pending" "$(curl -s "$base/status/$second")" '{"status":"pending","install":null}'
+check "declined" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d '{"status":"declined"}' "$base/admin/requests/$second")" "200"
+third="$(enroll alex)"
+check "a declined iPhone can ask again" "$(curl -s "$base/status/${third##*request=}")" '{"status":"pending","install":null}'
+device MacBookPro18,1 00008112-000A1B2C3D4E5F61 mac
+check "computers are sent back with an explanation" "$(enroll mac)" "$base/?error=iphone"
+check "garbage is sent back with an explanation" "$(curl -s -o /dev/null -w '%{redirect_url}' -X POST --data-binary 'not a device' "$base/enroll")" "$base/?error=device"
+for index in $(seq 1 30); do
+    device iPhone17,1 "$(printf '00008140-%016X' "$index")" "$index"
 done
-device iPhone17,1 00008140-00000000000000FF
-check "waiting requests are capped" "$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary @"$work/device.p7s" "$base/enroll")" "429"
+enrollments=()
+for index in $(seq 1 30); do
+    enroll "$index" > "$work/result-$index" &
+    enrollments+=($!)
+done
+wait "${enrollments[@]}"
+open="$(curl -s "${admin[@]}" "$base/admin/requests" | grep -o '"status":"pending"' | wc -l | tr -d ' ')"
+check "the waiting cap holds under parallel requests" "$open" "20"
+check "extra requests are told to try later" "$(cat "$work"/result-* | grep -o 'error=busy' | wc -l | tr -d ' ')" "11"
 check "unknown requests" "$(curl -s -o /dev/null -w '%{http_code}' "$base/status/00000000-0000-0000-0000-000000000000")" "404"
-printf 'Passed worker page script, profile, enrollment, re-requests, admin auth, status transitions, pinned install links, device checks, and the waiting cap.\n'
+printf 'Passed worker page script, hidden buttons, profile, enrollment, approval for every request, admin auth, status transitions, pinned install links, device checks, and the atomic waiting cap.\n'

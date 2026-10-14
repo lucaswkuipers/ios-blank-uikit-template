@@ -67,21 +67,23 @@ do {
     try expectFailure { try verifyPersonalSettings(personal, expectedBundle: "com.lucaswkuipers.Other") }
 
     let directProfile: [String: Any] = ["TeamIdentifier": ["AR7T5G5Z83"], "ProvisionedDevices": ["personal-iphone"], "Entitlements": ["application-identifier": "AR7T5G5Z83.com.lucaswkuipers.Test", "get-task-allow": false], "ExpirationDate": Date().addingTimeInterval(86400 * 30)]
-    _ = try verifyDirectProfile(directProfile, bundle: "com.lucaswkuipers.Test", devices: ["personal-iphone"])
+    _ = try verifyDirectProfile(directProfile, bundle: "com.lucaswkuipers.Test", provisioning: .exactly(["personal-iphone"]))
     for (key, value) in [("TeamIdentifier", ["OTHERTEAM1"] as Any), ("ProvisionedDevices", ["personal-iphone", "another-device"] as Any), ("ExpirationDate", Date() as Any), ("ProvisionsAllDevices", true as Any), ("Entitlements", ["application-identifier": "AR7T5G5Z83.com.lucaswkuipers.Test", "get-task-allow": true] as Any)] {
         var invalid = directProfile
         invalid[key] = value
-        try expectFailure { _ = try verifyDirectProfile(invalid, bundle: "com.lucaswkuipers.Test", devices: ["personal-iphone"]) }
+        try expectFailure { _ = try verifyDirectProfile(invalid, bundle: "com.lucaswkuipers.Test", provisioning: .exactly(["personal-iphone"])) }
     }
-    try expectFailure { _ = try verifyDirectProfile(directProfile, bundle: "com.lucaswkuipers.Other", devices: ["personal-iphone"]) }
-    try expectFailure { _ = try verifyDirectProfile(directProfile, bundle: "com.lucaswkuipers.Test", devices: ["another-device"]) }
-    try expectFailure { _ = try verifyDirectProfile(directProfile, bundle: "com.lucaswkuipers.Test", devices: ["personal-iphone", "friend-iphone"]) }
+    try expectFailure { _ = try verifyDirectProfile(directProfile, bundle: "com.lucaswkuipers.Other", provisioning: .exactly(["personal-iphone"])) }
+    try expectFailure { _ = try verifyDirectProfile(directProfile, bundle: "com.lucaswkuipers.Test", provisioning: .exactly(["another-device"])) }
+    try expectFailure { _ = try verifyDirectProfile(directProfile, bundle: "com.lucaswkuipers.Test", provisioning: .exactly(["personal-iphone", "friend-iphone"])) }
     var sharedProfile = directProfile
     sharedProfile["ProvisionedDevices"] = ["friend-iphone", "personal-iphone"]
-    _ = try verifyDirectProfile(sharedProfile, bundle: "com.lucaswkuipers.Test", devices: ["personal-iphone", "friend-iphone"])
-    try expectFailure { _ = try verifyDirectProfile(sharedProfile, bundle: "com.lucaswkuipers.Test", devices: ["personal-iphone"]) }
+    _ = try verifyDirectProfile(sharedProfile, bundle: "com.lucaswkuipers.Test", provisioning: .exactly(["personal-iphone", "friend-iphone"]))
+    try expectFailure { _ = try verifyDirectProfile(sharedProfile, bundle: "com.lucaswkuipers.Test", provisioning: .exactly(["personal-iphone"])) }
+    _ = try verifyDirectProfile(sharedProfile, bundle: "com.lucaswkuipers.Test", provisioning: .including("FRIEND-IPHONE"))
+    try expectFailure { _ = try verifyDirectProfile(sharedProfile, bundle: "com.lucaswkuipers.Test", provisioning: .including("stranger-iphone")) }
     sharedProfile["ProvisionedDevices"] = ["personal-iphone", "personal-iphone"]
-    try expectFailure { _ = try verifyDirectProfile(sharedProfile, bundle: "com.lucaswkuipers.Test", devices: ["personal-iphone", "friend-iphone"]) }
+    try expectFailure { _ = try verifyDirectProfile(sharedProfile, bundle: "com.lucaswkuipers.Test", provisioning: .exactly(["personal-iphone", "friend-iphone"])) }
 
     let payloadExpiry = try JSONSerialization.data(withJSONObject: ["exp": 1000]).base64EncodedString().replacingOccurrences(of: "=", with: "")
     let download = URL(string: "https://release-assets.githubusercontent.com/artifact?se=2099-01-01T00:00:00Z&jwt=header.\(payloadExpiry).signature")!

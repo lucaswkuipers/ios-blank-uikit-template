@@ -49,6 +49,57 @@ struct ShelfAccessRecord {
     }
 }
 
+struct ShelfResignFailure: Codable {
+    let commit: String
+    let deviceSet: String
+    let attempts: Int
+    let retryAfter: Date
+    let reason: String
+}
+
+struct ShelfResignMemory: Codable {
+    static let path = TestFlightConfiguration.directory.appendingPathComponent("shelf-resign-failures.json")
+
+    var failures: [String: ShelfResignFailure]
+
+    static func load() throws -> Self {
+        guard files.fileExists(atPath: path.path) else {
+            return Self(failures: [:])
+        }
+        return try JSONDecoder().decode(Self.self, from: Data(contentsOf: path))
+    }
+
+    func save() throws {
+        try JSONEncoder().encode(self).write(to: Self.path, options: .atomic)
+        try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.path.path)
+    }
+
+    func blocks(_ application: ShelfApplication, devices: ShelfDevices, at date: Date) -> Bool {
+        guard let failure = failures[application.bundleIdentifier] else {
+            return false
+        }
+        return failure.commit == application.sourceCommit && failure.deviceSet == devices.identifier && failure.retryAfter > date
+    }
+
+    mutating func record(_ application: ShelfApplication, devices: ShelfDevices, reason: String, at date: Date) {
+        let previous = failures[application.bundleIdentifier]
+        let repeated = previous?.commit == application.sourceCommit && previous?.deviceSet == devices.identifier
+        let attempts = repeated ? (previous?.attempts ?? 0) + 1 : 1
+        let delay = min(1800 * pow(2, Double(attempts - 1)), 86400)
+        failures[application.bundleIdentifier] = ShelfResignFailure(commit: application.sourceCommit, deviceSet: devices.identifier, attempts: attempts, retryAfter: date.addingTimeInterval(delay), reason: reason)
+    }
+}
+
+func outstandingResigns(_ catalog: ShelfCatalog, devices: ShelfDevices, memory: ShelfResignMemory, at date: Date) -> [ShelfApplication] {
+    catalog.applications.filter { !devices.isCurrent($0) && !memory.blocks($0, devices: devices, at: date) }
+}
+
+func shelfDisplayName(_ name: String) -> String {
+    let hidden = CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "\u{200E}\u{200F}\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}\u{2066}\u{2067}\u{2068}\u{2069}"))
+    let visible = String(String.UnicodeScalarView(name.unicodeScalars.filter { !hidden.contains($0) })).trimmingCharacters(in: .whitespaces)
+    return visible.isEmpty ? "iPhone" : String(visible.prefix(50))
+}
+
 struct ShelfRequests {
     let configuration: ShelfRequestsConfiguration
     let cloud: ShelfNotificationPublisher
@@ -76,12 +127,29 @@ struct ShelfRequests {
         return try appleRequest(request, session: session)
     }
 
-    func updateWorker(_ id: String, status: String) throws {
-        _ = try workerRequest("/admin/requests/\(id)", body: ["status": status])
+    func updateWorker(_ id: String, status visitorStatus: String) throws {
+        guard UUID(uuidString: id) != nil else {
+            return
+        }
+        do {
+            _ = try workerRequest("/admin/requests/\(id.lowercased())", body: ["status": visitorStatus])
+        } catch let error as AppleHTTPError where error.status == 404 {
+            status("The request page no longer has request \(id); skipping its page update.")
+        }
     }
 
     func setInstallLink(_ link: String) throws {
-        _ = try workerRequest("/admin/install", body: ["link": link])
+        for attempt in 1...3 {
+            do {
+                _ = try workerRequest("/admin/install", body: ["link": link])
+                return
+            } catch {
+                guard attempt < 3 else {
+                    throw CommandError(message: "The request page did not accept the new AppShelf install link: \(error.localizedDescription)")
+                }
+                Thread.sleep(forTimeInterval: Double(attempt * 5))
+            }
+        }
     }
 
     func records() throws -> [ShelfAccessRecord] {
@@ -99,91 +167,138 @@ struct ShelfRequests {
         }
     }
 
+    func lookup(_ name: String) throws -> ShelfAccessRecord? {
+        let results = try cloud.records(operation: "lookup", body: ["records": [["recordName": name]]])
+        guard results.count == 1, let result = results.first else {
+            throw CommandError(message: "CloudKit returned no lookup result for access request \(name).")
+        }
+        if result["serverErrorCode"] as? String == "NOT_FOUND" {
+            return nil
+        }
+        if let failure = result["serverErrorCode"] {
+            throw CommandError(message: "CloudKit could not read access request \(name): \(failure) \(result["reason"] ?? "").")
+        }
+        return try ShelfAccessRecord(result)
+    }
+
     func modify(_ operation: [String: Any]) throws {
         let results = try cloud.records(operation: "modify", body: ["operations": [operation]])
         guard results.count == 1, results[0]["serverErrorCode"] == nil else {
-            throw CommandError(message: "CloudKit did not save the access request: \(results.first?["serverErrorCode"] ?? "no result").")
+            throw CommandError(message: "CloudKit did not save the access request: \(results.first?["serverErrorCode"] ?? "no result") \(results.first?["reason"] ?? "").")
         }
     }
 
-    func setStatus(_ status: String, detail: String, of record: ShelfAccessRecord) throws {
+    func create(name: String, udid: String, deviceName: String, model: String, systemVersion: String, status: String, detail: String) throws {
+        let fields = ["deviceName": deviceName, "model": model, "systemVersion": systemVersion, "udid": udid, "status": status, "detail": detail]
+        try modify(["operationType": "create", "record": ["recordType": "ShelfAccessRequest", "recordName": name, "fields": fields.mapValues { ["value": $0] }]])
+    }
+
+    @discardableResult
+    func transition(_ name: String, from statuses: [String], to status: String, detail: String) throws -> Bool {
+        guard let record = try lookup(name), statuses.contains(record.status) else {
+            return false
+        }
         let fields = ["status": ["value": status], "detail": ["value": String(detail.prefix(500))]]
         try modify(["operationType": "update", "record": ["recordType": "ShelfAccessRequest", "recordName": record.name, "recordChangeTag": record.changeTag, "fields": fields]])
+        return true
     }
 
-    func update(_ record: ShelfAccessRecord, _ change: () throws -> Void) {
+    func delete(_ name: String) throws {
+        try modify(["operationType": "forceDelete", "record": ["recordName": name]])
+    }
+
+    func isolate(_ record: ShelfAccessRecord, _ work: () throws -> Void) {
         do {
-            try change()
+            try work()
         } catch {
-            status("Could not update the access request for \(record.deviceName); the next refresh retries: \(error.localizedDescription)")
+            status("Could not update the access request for \(record.deviceName); a later refresh retries: \(error.localizedDescription)")
         }
-    }
-
-    func delete(_ record: ShelfAccessRecord) throws {
-        try modify(["operationType": "forceDelete", "record": ["recordName": record.name]])
     }
 
     func relay(devices: ShelfDevices) throws {
-        let pending = try JSONDecoder().decode([ShelfWorkerRequest].self, from: workerRequest("/admin/requests", body: nil)).filter { $0.status == "pending" }
-        guard !pending.isEmpty else {
-            return
-        }
-        let known = Set(try records().map(\.name))
+        let pending = try JSONDecoder().decode([ShelfWorkerRequest].self, from: workerRequest("/admin/requests", body: nil))
         for request in pending {
-            if devices.includes(request.udid) {
-                try updateWorker(request.id, status: "ready")
-                continue
-            }
-            if !known.contains(request.id) {
-                let fields = ["deviceName": request.deviceName, "model": request.model, "systemVersion": request.systemVersion, "udid": request.udid, "status": "waiting"]
-                try modify(["operationType": "create", "record": ["recordType": "ShelfAccessRequest", "recordName": request.id, "fields": fields.mapValues { ["value": $0] }]])
-            }
-            try updateWorker(request.id, status: "waiting")
-            status("Asked the shelf owner to approve \(request.deviceName).")
-        }
-    }
-
-    func markReady(devices: ShelfDevices) throws {
-        for record in try records() where record.status == "preparing" && devices.includes(record.udid) {
-            update(record) {
-                try updateWorker(record.name, status: "ready")
-                try setStatus("ready", detail: "", of: record)
+            let deviceName = shelfDisplayName(request.deviceName)
+            do {
+                if try lookup(request.id) == nil {
+                    let detail = devices.includes(request.udid) ? "This iPhone already has access and asked again." : ""
+                    try create(name: request.id, udid: request.udid, deviceName: deviceName, model: shelfDisplayName(request.model), systemVersion: shelfDisplayName(request.systemVersion), status: "waiting", detail: detail)
+                }
+                try updateWorker(request.id, status: "waiting")
+                status("Asked the shelf owner to approve \(deviceName).")
+            } catch {
+                status("Could not pass on the request from \(deviceName); a later refresh retries: \(error.localizedDescription)")
             }
         }
     }
 
-    func finish(devices: ShelfDevices, failures: [String]) throws {
-        for record in try records() {
-            if ["preparing", "ready"].contains(record.status), devices.includes(record.udid) {
-                update(record) {
+    func markReady(devices: ShelfDevices) {
+        do {
+            for record in try records() where ["preparing", "failed"].contains(record.status) && devices.includes(record.udid) {
+                isolate(record) {
                     try updateWorker(record.name, status: "ready")
-                    try setStatus(failures.isEmpty ? "shared" : "failed", detail: failures.joined(separator: "\n"), of: record)
-                }
-            } else if record.status == "removing", !devices.includes(record.udid) {
-                update(record) {
-                    try updateWorker(record.name, status: "removed")
-                    try delete(record)
+                    try transition(record.name, from: ["preparing", "failed"], to: "ready", detail: "")
                 }
             }
+        } catch {
+            status("Could not list access requests to mark them ready: \(error.localizedDescription)")
         }
     }
 
-    func fail(devices: ShelfDevices, detail: String) throws {
-        for record in try records() {
-            if ["preparing", "ready"].contains(record.status), devices.includes(record.udid) {
-                update(record) {
-                    try setStatus("failed", detail: detail, of: record)
-                }
-            } else if record.status == "removing" {
-                update(record) {
-                    try setStatus("remove-failed", detail: detail, of: record)
+    func finish(devices: ShelfDevices, sharing: ShelfSharing, unavailable: [String]) {
+        let detail = unavailable.isEmpty ? "" : "Still preparing for this iPhone: " + unavailable.joined(separator: ", ")
+        do {
+            let records = try records()
+            for record in records {
+                isolate(record) {
+                    let included = devices.includes(record.udid)
+                    if included && ["preparing", "ready", "failed", "shared"].contains(record.status) {
+                        try updateWorker(record.name, status: "ready")
+                        if record.status != "shared" || record.detail != detail {
+                            try transition(record.name, from: [record.status], to: "shared", detail: detail)
+                        }
+                    } else if !included && ["preparing", "ready", "shared", "remove", "removing", "remove-failed"].contains(record.status) {
+                        try updateWorker(record.name, status: "removed")
+                        try delete(record.name)
+                    } else if included && record.status == "removing" {
+                        try transition(record.name, from: ["removing"], to: "remove-failed", detail: "This iPhone is still in the shelf's signing list.")
+                    }
                 }
             }
+            let recorded = Set(records.filter { !["declined", "failed"].contains($0.status) }.map { $0.udid.lowercased() })
+            for device in sharing.devices where !recorded.contains(device.udid.lowercased()) {
+                do {
+                    if try lookup("device-\(device.id)") == nil {
+                        try create(name: "device-\(device.id)", udid: device.udid, deviceName: device.name, model: "", systemVersion: "", status: "shared", detail: detail)
+                    }
+                } catch {
+                    status("Could not list \(device.name) in AppShelf's Sharing screen: \(error.localizedDescription)")
+                }
+            }
+        } catch {
+            status("Could not list access requests to finish them: \(error.localizedDescription)")
+        }
+    }
+
+    func fail(devices: ShelfDevices, detail: String) {
+        do {
+            for record in try records() {
+                isolate(record) {
+                    if record.status == "preparing" && devices.includes(record.udid) {
+                        try updateWorker(record.name, status: "failed")
+                        try transition(record.name, from: ["preparing"], to: "failed", detail: detail)
+                    } else if record.status == "removing" {
+                        try transition(record.name, from: ["removing"], to: "remove-failed", detail: detail)
+                    }
+                }
+            }
+        } catch {
+            status("Could not list access requests to mark them failed: \(error.localizedDescription)")
         }
     }
 }
 
-func processShelfRequests() {
+func processShelfRequests(store: ShelfStore) {
     do {
         let session = URLSession(configuration: .ephemeral, delegate: RejectRedirect(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
@@ -193,45 +308,55 @@ func processShelfRequests() {
         try requests.relay(devices: try ShelfDevices.load())
         let records = try requests.records()
         for record in records where record.status == "declined" {
-            try requests.updateWorker(record.name, status: "declined")
-            try requests.delete(record)
+            requests.isolate(record) {
+                try requests.updateWorker(record.name, status: "declined")
+                try requests.delete(record.name)
+            }
         }
         guard try shelfShareIsIdle() else {
             return
         }
-        var work = false
+        var changed = false
         for record in records where record.status == "approved" {
-            do {
-                try addShelfDevice(udid: record.udid, name: record.deviceName)
-                try requests.setStatus("preparing", detail: "", of: record)
-                try requests.updateWorker(record.name, status: "preparing")
-                work = true
-            } catch {
-                status("Could not approve \(record.deviceName): \(error.localizedDescription)")
-                try requests.setStatus("failed", detail: error.localizedDescription, of: record)
+            requests.isolate(record) {
+                do {
+                    try addShelfDevice(udid: record.udid, name: record.deviceName)
+                } catch {
+                    status("Could not approve \(record.deviceName): \(error.localizedDescription)")
+                    if try requests.transition(record.name, from: ["approved"], to: "failed", detail: error.localizedDescription) {
+                        try requests.updateWorker(record.name, status: "failed")
+                    }
+                    return
+                }
+                try ShelfResignMemory(failures: [:]).save()
+                if try requests.transition(record.name, from: ["approved"], to: "preparing", detail: "") {
+                    try requests.updateWorker(record.name, status: "preparing")
+                }
+                changed = true
             }
         }
-        let sharing = try ShelfSharing.load()
-        for record in records where ["remove", "removing"].contains(record.status) {
-            if sharing.devices.contains(where: { $0.udid.caseInsensitiveCompare(record.udid) == .orderedSame }) {
-                try removeShelfDevice(record.udid)
-            }
-            if record.status == "remove" {
-                try requests.setStatus("removing", detail: "", of: record)
-            }
-            work = true
-        }
-        let devices = try ShelfDevices.load()
-        for record in records where ["preparing", "ready"].contains(record.status) {
-            if devices.includes(record.udid) {
-                work = true
-            } else {
-                try requests.setStatus("failed", detail: "This iPhone is no longer in the shelf's signing list.", of: record)
+        let owner = try DirectConfiguration.load().deviceUDID
+        for record in records where record.status == "remove" {
+            requests.isolate(record) {
+                guard owner.caseInsensitiveCompare(record.udid) != .orderedSame else {
+                    try requests.transition(record.name, from: ["remove"], to: "shared", detail: "This is the shelf owner's iPhone, which always keeps access.")
+                    return
+                }
+                if try ShelfSharing.load().devices.contains(where: { $0.udid.caseInsensitiveCompare(record.udid) == .orderedSame }) {
+                    try removeShelfDevice(record.udid)
+                }
+                try requests.transition(record.name, from: ["remove"], to: "removing", detail: "")
+                changed = true
             }
         }
-        if work {
-            try spawnShelfShare()
+        let (_, catalog) = try store.catalog()
+        let outstanding = !outstandingResigns(catalog, devices: try ShelfDevices.load(), memory: try ShelfResignMemory.load(), at: Date()).isEmpty
+        let unfinished = records.contains { ["preparing", "ready", "removing"].contains($0.status) }
+        let due = try shelfShareSpawnedBefore(Date().addingTimeInterval(-600))
+        guard changed || ((outstanding || unfinished) && due) else {
+            return
         }
+        try spawnShelfShare()
     } catch {
         status("Shelf access requests deferred until a later refresh: \(error.localizedDescription)")
     }
@@ -258,7 +383,19 @@ func shelfShareIsIdle() throws -> Bool {
     return flock(descriptor, LOCK_EX | LOCK_NB) == 0
 }
 
+func shelfShareSpawnedBefore(_ date: Date) throws -> Bool {
+    let marker = TestFlightConfiguration.directory.appendingPathComponent("shelf-share.spawned")
+    guard files.fileExists(atPath: marker.path) else {
+        return true
+    }
+    guard let modified = try files.attributesOfItem(atPath: marker.path)[.modificationDate] as? Date else {
+        throw CommandError(message: "Cannot read when the shelf was last re-signed.")
+    }
+    return modified < date
+}
+
 func spawnShelfShare() throws {
+    try Data().write(to: TestFlightConfiguration.directory.appendingPathComponent("shelf-share.spawned"), options: .atomic)
     guard let executable = Bundle.main.executablePath else {
         throw CommandError(message: "Cannot locate the uikit-app executable.")
     }
@@ -294,10 +431,13 @@ func spawnShelfShare() throws {
 
 @discardableResult
 func wrangler(_ arguments: [String], directory: URL) throws -> String {
-    var environment = ProcessInfo.processInfo.environment
+    let inherited = ProcessInfo.processInfo.environment
+    var environment = ["HOME", "USER", "LOGNAME", "LANG", "TMPDIR"].reduce(into: [String: String]()) { values, key in
+        values[key] = inherited[key]
+    }
+    environment["PATH"] = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     environment["npm_config_cache"] = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/npm").path
     environment["WRANGLER_SEND_METRICS"] = "false"
-    environment["PATH"] = "/usr/local/bin:/opt/homebrew/bin:" + (environment["PATH"] ?? "/usr/bin:/bin")
     return try run("/usr/bin/env", ["-C", directory.path, "npx", "--yes", "wrangler@4.143.0"] + arguments, log: nil, environment: environment, separateError: true)
 }
 
@@ -360,8 +500,27 @@ func setupShelfRequests(template: URL) throws {
         }
         try files.copyItem(at: template.appendingPathComponent("CLI/ShelfRequests/\(file)"), to: destination)
     }
-    guard !(try wrangler(["whoami"], directory: directory)).localizedCaseInsensitiveContains("not authenticated") else {
-        throw RequiredAction(result: "needs-cloudflare-login", message: "Sign in to the free Cloudflare account in the browser, then rerun setup-shelf-requests.", command: "npm_config_cache=$HOME/Library/Caches/uikit-app/npm npx --yes wrangler@4.143.0 login")
+    struct Account: Decodable {
+        let id: String
+        let name: String
+    }
+    struct Identity: Decodable {
+        let loggedIn: Bool
+        let accounts: [Account]?
+    }
+    let login = RequiredAction(result: "needs-cloudflare-login", message: "Sign in to the free Cloudflare account in the browser, then rerun setup-shelf-requests.", command: "npm_config_cache=$HOME/Library/Caches/uikit-app/npm npx --yes wrangler@4.143.0 login")
+    let identity: Identity
+    do {
+        identity = try JSONDecoder().decode(Identity.self, from: Data(wrangler(["whoami", "--json"], directory: directory).utf8))
+    } catch {
+        status("Cloudflare login check: \(error.localizedDescription)")
+        throw login
+    }
+    guard identity.loggedIn, let accounts = identity.accounts else {
+        throw login
+    }
+    guard accounts.count == 1, let account = accounts.first else {
+        throw CommandError(message: "Cloudflare login has \(accounts.count) accounts (\(accounts.map(\.name).joined(separator: ", "))); setup needs exactly one free personal account.")
     }
     struct Database: Decodable {
         let uuid: String
@@ -385,6 +544,7 @@ func setupShelfRequests(template: URL) throws {
     }
     let manifest = """
     name = "appshelf"
+    account_id = "\(account.id)"
     main = "worker.js"
     compatibility_date = "2026-09-01"
     workers_dev = true
@@ -394,6 +554,7 @@ func setupShelfRequests(template: URL) throws {
     [vars]
     OWNER_NAME = "Lucas"
     INSTALL_LINK = "\(installLink)"
+    INSTALL_PREFIX = "\(try shelfInstallLink(manifestURL: "https://gist.githubusercontent.com/lucaswkuipers/\(gist)/raw/"))"
     MINIMUM_SYSTEM = "\(shelf.minimumOSVersion)"
 
     [[d1_databases]]
@@ -403,12 +564,17 @@ func setupShelfRequests(template: URL) throws {
 
     """
     try manifest.write(to: directory.appendingPathComponent("wrangler.toml"), atomically: true, encoding: .utf8)
-    try wrangler(["d1", "execute", "appshelf-requests", "--remote", "--file", "schema.sql", "--yes"], directory: directory)
+    try wrangler(["d1", "execute", "appshelf-requests", "--remote", "--command", String(contentsOf: directory.appendingPathComponent("schema.sql"), encoding: .utf8), "--yes"], directory: directory)
     let saved = try ShelfRequestsConfiguration.load()
+    let adminToken = try saved?.adminToken ?? run("/usr/bin/openssl", ["rand", "-hex", "32"], log: nil)
+    let secrets = directory.appendingPathComponent("secrets.json")
+    try JSONEncoder().encode(["ADMIN_TOKEN": adminToken]).write(to: secrets)
+    try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: secrets.path)
+    defer { try? files.removeItem(at: secrets) }
     let profile = directory.appendingPathComponent("request.mobileconfig")
     func deploy() throws -> String {
         do {
-            let output = try wrangler(["deploy"], directory: directory)
+            let output = try wrangler(["deploy", "--secrets-file", "secrets.json"], directory: directory)
             guard let range = output.range(of: "https://appshelf\\.[A-Za-z0-9-]+\\.workers\\.dev", options: .regularExpression) else {
                 throw CommandError(message: "Cloudflare deployed without reporting the appshelf workers.dev address:\n\(output)")
             }
@@ -429,12 +595,7 @@ func setupShelfRequests(template: URL) throws {
     guard try deploy() == url else {
         throw CommandError(message: "Cloudflare moved the access-request worker away from \(url).")
     }
-    let configuration = ShelfRequestsConfiguration(url: url, adminToken: try saved?.adminToken ?? run("/usr/bin/openssl", ["rand", "-hex", "32"], log: nil))
-    let secrets = directory.appendingPathComponent("secrets.json")
-    try JSONEncoder().encode(["ADMIN_TOKEN": configuration.adminToken]).write(to: secrets)
-    try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: secrets.path)
-    defer { try? files.removeItem(at: secrets) }
-    try wrangler(["secret", "bulk", "secrets.json"], directory: directory)
+    let configuration = ShelfRequestsConfiguration(url: url, adminToken: adminToken)
     try JSONEncoder().encode(configuration).write(to: ShelfRequestsConfiguration.path, options: .atomic)
     try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: ShelfRequestsConfiguration.path.path)
     let session = URLSession(configuration: .ephemeral, delegate: RejectRedirect(), delegateQueue: nil)

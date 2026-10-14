@@ -102,36 +102,47 @@ func shareShelf(options: Options) throws {
     let session = URLSession(configuration: .ephemeral, delegate: RejectRedirect(), delegateQueue: nil)
     defer { session.invalidateAndCancel() }
     let requests = try ShelfRequests.load(session: session)
+    var memory = try ShelfResignMemory.load()
+    func resign(_ application: ShelfApplication) throws {
+        do {
+            try resignShelfApplication(application, store: store, devices: devices)
+        } catch {
+            memory.record(application, devices: devices, reason: error.localizedDescription, at: Date())
+            try memory.save()
+            throw error
+        }
+        memory.failures[application.bundleIdentifier] = nil
+        try memory.save()
+    }
     let invite: ShelfInvite
-    var failures: [String] = []
+    let unavailable: [String]
     do {
         let (_, catalog) = try store.catalog()
-        let outdated = catalog.applications.filter { !devices.isCurrent($0) }
-        if let shelf = outdated.first(where: { $0.bundleIdentifier == "com.lucaswkuipers.AppShelf" }) {
-            try resignShelfApplication(shelf, store: store, devices: devices)
+        if let shelf = outstandingResigns(catalog, devices: devices, memory: memory, at: Date()).first(where: { $0.bundleIdentifier == "com.lucaswkuipers.AppShelf" }) {
+            try resign(shelf)
         }
         invite = try publishShelfInvite(store: store, devices: devices)
-        do {
-            try requests?.setInstallLink(invite.pinnedLink)
-        } catch {
-            status("The request page keeps its previous install link until the next share: \(error.localizedDescription)")
-        }
-        try requests?.markReady(devices: devices)
-        for application in outdated where application.bundleIdentifier != "com.lucaswkuipers.AppShelf" {
-            do {
-                try resignShelfApplication(application, store: store, devices: devices)
-            } catch {
-                status("Could not re-sign \(application.name): \(error.localizedDescription)")
-                failures.append("\(application.name): \(error.localizedDescription)")
+        try requests?.setInstallLink(invite.pinnedLink)
+        requests?.markReady(devices: devices)
+        for _ in 0..<3 {
+            let (_, latest) = try store.catalog()
+            let batch = outstandingResigns(latest, devices: devices, memory: memory, at: Date())
+            guard !batch.isEmpty else {
+                break
+            }
+            for application in batch {
+                do {
+                    try resign(application)
+                } catch {
+                    status("Could not re-sign \(application.name); it retries later with backoff: \(error.localizedDescription)")
+                }
             }
         }
-        try requests?.finish(devices: devices, failures: failures)
+        let (_, final) = try store.catalog()
+        unavailable = final.applications.filter { !devices.isCurrent($0) }.map(\.name)
+        requests?.finish(devices: devices, sharing: try ShelfSharing.load(), unavailable: unavailable)
     } catch {
-        do {
-            try requests?.fail(devices: devices, detail: error.localizedDescription)
-        } catch let failure {
-            status("Could not mark shelf requests as failed: \(failure.localizedDescription)")
-        }
+        requests?.fail(devices: devices, detail: error.localizedDescription)
         throw error
     }
     do {
@@ -140,9 +151,9 @@ func shareShelf(options: Options) throws {
         status("The invite link may install the previous AppShelf build for a few more minutes: \(error.localizedDescription)")
     }
     let shared = try ShelfSharing.load().devices.map(\.name).joined(separator: ", ")
-    try emit(["result": "shelf-shared", "sharedWith": shared, "invite": invite.link, "qrCode": invite.qrCode.path, "pendingApps": String(failures.count)])
-    guard failures.isEmpty else {
-        throw CommandError(message: "The invite works, but some apps are not yet signed for every shelf iPhone. Rerun uikit-app share-shelf to retry them:\n" + failures.joined(separator: "\n"))
+    try emit(["result": "shelf-shared", "sharedWith": shared, "invite": invite.link, "qrCode": invite.qrCode.path, "pendingApps": String(unavailable.count)])
+    guard unavailable.isEmpty else {
+        throw CommandError(message: "The invite works, but these apps are not yet signed for every shelf iPhone. They retry automatically with backoff, or rerun uikit-app share-shelf:\n" + unavailable.joined(separator: "\n"))
     }
 }
 
@@ -191,60 +202,42 @@ func removeShelfDevice(_ identifier: String) throws {
 }
 
 func resignShelfApplication(_ application: ShelfApplication, store: ShelfStore, devices: ShelfDevices) throws {
-    let asset = try store.decoder.decode(ShelfAsset.self, from: Data(store.github.call(["api", "repos/\(ShelfStore.repository)/releases/assets/\(application.packageAssetID)"]).utf8))
+    let (_, catalog) = try store.catalog()
+    guard let current = catalog.applications.first(where: { $0.bundleIdentifier == application.bundleIdentifier }), !devices.isCurrent(current) else {
+        return
+    }
+    let asset = try store.decoder.decode(ShelfAsset.self, from: Data(store.github.call(["api", "repos/\(ShelfStore.repository)/releases/assets/\(current.packageAssetID)"]).utf8))
     try validate(asset.name, pattern: "^[A-Za-z][A-Za-z0-9]*\\.ipa$", label: "shelf package name")
-    let repository = try store.github.repository(name: String(asset.name.dropLast(".ipa".count)))
-    status("Re-signing \(application.name) for \(devices.udids.count) iPhones…")
-    var workflowError: Error?
-    do {
-        try runShelfWorkflow(repository: repository.nameWithOwner, github: store.github)
-    } catch {
-        workflowError = error
+    try validate(current.sourceCommit, pattern: "^[0-9a-f]{40}$", label: "cataloged source commit")
+    let name = String(asset.name.dropLast(".ipa".count))
+    _ = try store.github.repository(name: name)
+    let capacity = try files.homeDirectoryForCurrentUser.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage ?? 0
+    guard capacity > 3_000_000_000 else {
+        throw CommandError(message: "Only \(capacity / 1_000_000) MB of disk space is free; re-signing needs at least 3 GB. Free some space; the share retries automatically.")
     }
+    let checkout = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/Resign/\(name)")
+    let credentials = ["-c", "credential.helper=", "-c", "credential.helper=!\(PersonalGitHub.executable) auth git-credential"]
+    if !files.fileExists(atPath: checkout.appendingPathComponent(".git").path) {
+        if files.fileExists(atPath: checkout.path) {
+            try files.removeItem(at: checkout)
+        }
+        try files.createDirectory(at: checkout.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try store.github.git(checkout.deletingLastPathComponent(), credentials + ["clone", "--quiet", "--no-checkout", "https://github.com/lucaswkuipers/\(name).git", checkout.path], remote: true)
+    }
+    try store.github.git(checkout, credentials + ["fetch", "--quiet", "origin"], remote: true)
+    try store.github.git(checkout, ["checkout", "--quiet", "--force", "--detach", current.sourceCommit], remote: false)
+    try store.github.git(checkout, ["clean", "--quiet", "-ffdx"], remote: false)
+    if current.bundleIdentifier == "com.lucaswkuipers.AppShelf" {
+        let access = checkout.appendingPathComponent("AppShelf/ShelfAccess.generated.json")
+        try files.copyItem(at: TestFlightConfiguration.directory.appendingPathComponent("shelf-access.json"), to: access)
+        try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: access.path)
+    }
+    status("Re-signing \(current.name) \(current.version) (\(current.build)) from \(current.sourceCommit.prefix(7)) for \(devices.udids.count) iPhones…")
+    try deliverDirect(directory: checkout.path)
     let (_, updated) = try store.catalog()
-    if let resigned = updated.applications.first(where: { $0.bundleIdentifier == application.bundleIdentifier }), devices.isCurrent(resigned) {
-        return
+    guard let resigned = updated.applications.first(where: { $0.bundleIdentifier == application.bundleIdentifier }), devices.isCurrent(resigned) else {
+        throw CommandError(message: "The re-signed build of \(current.name) was not published for every shelf iPhone.")
     }
-    throw workflowError ?? CommandError(message: "Its workflow succeeded without publishing a build for every shelf iPhone.")
-}
-
-func runShelfWorkflow(repository: String, github: PersonalGitHub) throws {
-    let list = ["run", "list", "--repo", repository, "--workflow", DeliveryRoute.shelf.workflow, "--event", "workflow_dispatch", "--json", "databaseId,status,conclusion,url", "--limit", "20"]
-    let earlier = Set(try JSONDecoder().decode([DeliveryRun].self, from: Data(github.call(list).utf8)).map(\.databaseId))
-    try github.call(["workflow", "run", DeliveryRoute.shelf.workflow, "--repo", repository, "--ref", "main"])
-    let dispatched = Date()
-    let deadline = dispatched.addingTimeInterval(2700)
-    var waitingSince = dispatched
-    var previousStatus = ""
-    while Date() < deadline {
-        Thread.sleep(forTimeInterval: 10)
-        let runs = try JSONDecoder().decode([DeliveryRun].self, from: Data(github.call(list).utf8))
-        guard let delivery = runs.first(where: { !earlier.contains($0.databaseId) }) else {
-            guard Date().timeIntervalSince(dispatched) < 300 else {
-                throw CommandError(message: "GitHub did not list the dispatched shelf workflow within five minutes.")
-            }
-            continue
-        }
-        if delivery.status != previousStatus {
-            status("GitHub delivery: \(delivery.status) — \(delivery.url)")
-            previousStatus = delivery.status
-            waitingSince = Date()
-        }
-        if delivery.status != "in_progress" && delivery.status != "completed" {
-            guard Date().timeIntervalSince(waitingSince) < 900 else {
-                throw CommandError(message: "The Mac runner did not start the shelf workflow within 15 minutes: \(delivery.url)")
-            }
-            continue
-        }
-        guard delivery.status == "completed" else {
-            continue
-        }
-        guard delivery.conclusion == "success" else {
-            throw CommandError(message: "Its shelf workflow finished with \(delivery.conclusion): \(delivery.url)")
-        }
-        return
-    }
-    throw CommandError(message: "Its shelf workflow did not finish within 45 minutes.")
 }
 
 func publishShelfInvite(store: ShelfStore, devices: ShelfDevices) throws -> ShelfInvite {
@@ -259,7 +252,7 @@ func publishShelfInvite(store: ShelfStore, devices: ShelfDevices) throws -> Shel
     let package = try shelfInstallPackage(application, store: store, cache: work)
     let unpacked = work.appendingPathComponent("Unpacked")
     try run("/usr/bin/ditto", ["-x", "-k", package.path, unpacked.path], log: nil)
-    try verifyShelfInstall(unpacked.appendingPathComponent("Payload/AppShelf.app"), application: application, devices: devices.udids)
+    try verifyShelfInstall(unpacked.appendingPathComponent("Payload/AppShelf.app"), application: application, provisioning: .exactly(devices.udids))
     let readme = """
     # AppShelf
 

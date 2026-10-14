@@ -34,6 +34,11 @@ final class MockShelfProtocol: URLProtocol {
             response = ["updated": 1]
         } else if path.hasSuffix("/records/query") {
             response = ["records": Self.cloudRecords]
+        } else if path.hasSuffix("/records/lookup") {
+            let names = (json["records"] as? [[String: Any]] ?? []).compactMap { $0["recordName"] as? String }
+            response = ["records": names.map { name in
+                Self.cloudRecords.first { $0["recordName"] as? String == name } ?? ["recordName": name, "serverErrorCode": "NOT_FOUND"]
+            }]
         } else {
             let operations = json["operations"] as? [[String: Any]] ?? []
             Self.cloudOperations += operations
@@ -58,10 +63,15 @@ func testShelfRequests(directory: URL) throws {
     let cloud = try ShelfNotificationPublisher(configuration: ShelfNotificationConfiguration(keyID: "test-key", keyPath: keyPath.path, enabledAt: .distantPast), session: session)
     let requests = ShelfRequests(configuration: ShelfRequestsConfiguration(url: "https://worker.invalid", adminToken: "token"), cloud: cloud, session: session)
     let owner = DirectConfiguration(certificateID: "CERTIFICAT", certificateSHA1: "SHA1", deviceID: "OWNERPHONE", deviceUDID: "owner-iphone")
-    let shared = ShelfDevices(configuration: owner, sharing: ShelfSharing(devices: [ShelfSharedDevice(id: "FRIENDFONE", udid: "FRIEND-IPHONE", name: "Friend")], inviteGist: nil))
+    let friend = ShelfSharedDevice(id: "FRIENDFONE", udid: "FRIEND-IPHONE", name: "Friend")
+    let sharing = ShelfSharing(devices: [friend], inviteGist: nil)
+    let shared = ShelfDevices(configuration: owner, sharing: sharing)
+    let identifier = { (name: String) in "\(name)-0000-0000-0000-000000000000".prefix(36).description }
+    let new = "11111111-1111-1111-1111-111111111111"
+    let own = "22222222-2222-2222-2222-222222222222"
 
     func row(_ id: String, udid: String, status: String) -> [String: Any] {
-        ["id": id, "udid": udid, "deviceName": "Phone \(id)", "model": "iPhone17,1", "systemVersion": "24A335", "status": status]
+        ["id": id, "udid": udid, "deviceName": "Phone\u{202E} \u{1B}[2J", "model": "iPhone17,1", "systemVersion": "24A335", "status": status]
     }
 
     func record(_ name: String, udid: String, status: String) -> [String: Any] {
@@ -84,29 +94,75 @@ func testShelfRequests(directory: URL) throws {
         }
     }
 
-    reset(rows: [row("new", udid: "stranger-iphone", status: "pending"), row("own", udid: "OWNER-IPHONE", status: "pending"), row("old", udid: "x", status: "waiting")], records: [record("known", udid: "y", status: "waiting")])
+    func field(_ name: String, of index: Int) -> String? {
+        let record = MockShelfProtocol.cloudOperations[index]["record"] as? [String: Any]
+        return ((record?["fields"] as? [String: Any])?[name] as? [String: Any])?["value"] as? String
+    }
+
+    reset(rows: [row(new, udid: "stranger-iphone", status: "pending"), row(own, udid: "OWNER-IPHONE", status: "pending")], records: [])
     try requests.relay(devices: shared)
-    try expect(operations() == ["create-new=waiting"], "New requests become owner-only CloudKit records")
-    try expect(MockShelfProtocol.workerUpdates == ["new=waiting", "own=ready"], "Approved iPhones that ask again are ready without bothering the owner")
+    try expect(operations() == ["create-\(new)=waiting", "create-\(own)=waiting"], "Every request, even from an approved iPhone, needs the owner's approval")
+    try expect(field("deviceName", of: 0) == "Phone [2J", "Device names lose control and direction-override characters")
+    try expect(field("detail", of: 1) == "This iPhone already has access and asked again." && field("detail", of: 0) == "", "Repeat requests from approved iPhones are labeled")
+    try expect(MockShelfProtocol.workerUpdates == ["\(new)=waiting", "\(own)=waiting"], "Visitors learn the owner was notified")
 
-    reset(rows: [], records: [record("friend", udid: "friend-iphone", status: "preparing"), record("other", udid: "stranger-iphone", status: "preparing")])
-    try requests.markReady(devices: shared)
-    try expect(operations() == ["update-friend=ready"] && MockShelfProtocol.workerUpdates == ["friend=ready"], "Only iPhones in the signed set become ready")
+    reset(rows: [row(new, udid: "stranger-iphone", status: "pending")], records: [record(new, udid: "stranger-iphone", status: "waiting")])
+    try requests.relay(devices: shared)
+    try expect(operations().isEmpty && MockShelfProtocol.workerUpdates == ["\(new)=waiting"], "A relayed request is not created twice")
 
-    reset(rows: [], records: [record("friend", udid: "friend-iphone", status: "ready"), record("gone", udid: "stranger-iphone", status: "removing"), record("waiting", udid: "z", status: "waiting")])
-    try requests.finish(devices: shared, failures: [])
-    try expect(operations() == ["update-friend=shared", "forceDelete-gone"], "Finished shares and removals update only their own records")
-    try expect(MockShelfProtocol.workerUpdates == ["friend=ready", "gone=removed"], "Visitors see ready or removed after the share run")
+    let friendRequest = identifier("33333333")
+    let strangerRequest = identifier("44444444")
+    reset(rows: [], records: [record(friendRequest, udid: "friend-iphone", status: "preparing"), record(strangerRequest, udid: "stranger-iphone", status: "preparing")])
+    requests.markReady(devices: shared)
+    try expect(operations() == ["update-\(friendRequest)=ready"] && MockShelfProtocol.workerUpdates == ["\(friendRequest)=ready"], "Only iPhones in the signed set become ready")
 
-    reset(rows: [], records: [record("friend", udid: "friend-iphone", status: "ready")])
-    try requests.finish(devices: shared, failures: ["Magic Touch: build failed"])
-    let failedDetail = ((MockShelfProtocol.cloudOperations.first?["record"] as? [String: Any])?["fields"] as? [String: Any]).flatMap { ($0["detail"] as? [String: Any])?["value"] as? String }
-    try expect(operations() == ["update-friend=failed"] && failedDetail == "Magic Touch: build failed", "Partial failures stay visible with their reason")
+    let removed = identifier("55555555")
+    let declined = identifier("66666666")
+    reset(rows: [], records: [record(friendRequest, udid: "friend-iphone", status: "ready"), record(removed, udid: "stranger-iphone", status: "removing"), record(declined, udid: "z", status: "declined")])
+    requests.finish(devices: shared, sharing: sharing, unavailable: [])
+    try expect(operations() == ["update-\(friendRequest)=shared", "forceDelete-\(removed)"], "Finished shares and removals update only their own records")
+    try expect(MockShelfProtocol.workerUpdates == ["\(friendRequest)=ready", "\(removed)=removed"], "Visitors see ready or removed after the share run")
 
-    reset(rows: [], records: [record("friend", udid: "friend-iphone", status: "preparing"), record("gone", udid: "stranger-iphone", status: "removing")])
-    try requests.fail(devices: shared, detail: "AppShelf did not build")
-    try expect(operations() == ["update-friend=failed", "update-gone=remove-failed"], "A failed share run stops instead of retrying forever")
+    reset(rows: [], records: [record(friendRequest, udid: "friend-iphone", status: "ready")])
+    requests.finish(devices: shared, sharing: sharing, unavailable: ["Magic Touch"])
+    try expect(operations() == ["update-\(friendRequest)=shared"] && field("detail", of: 0) == "Still preparing for this iPhone: Magic Touch", "A share succeeds once AppShelf works and lists apps still preparing")
+
+    reset(rows: [], records: [record(friendRequest, udid: "friend-iphone", status: "shared")])
+    requests.finish(devices: ShelfDevices(configuration: owner, sharing: ShelfSharing(devices: [], inviteGist: nil)), sharing: ShelfSharing(devices: [], inviteGist: nil), unavailable: [])
+    try expect(operations() == ["forceDelete-\(friendRequest)"] && MockShelfProtocol.workerUpdates == ["\(friendRequest)=removed"], "Removing an iPhone from the command line also removes it from AppShelf")
+
+    reset(rows: [], records: [record(friendRequest, udid: "friend-iphone", status: "removing")])
+    requests.finish(devices: shared, sharing: sharing, unavailable: [])
+    try expect(operations() == ["update-\(friendRequest)=remove-failed"], "A removal that did not apply stops in a visible state")
+
+    reset(rows: [], records: [])
+    requests.finish(devices: shared, sharing: sharing, unavailable: [])
+    try expect(operations() == ["create-device-FRIENDFONE=shared"] && MockShelfProtocol.workerUpdates.isEmpty, "iPhones added from the command line appear in AppShelf without notifying the owner")
+
+    reset(rows: [], records: [record(friendRequest, udid: "friend-iphone", status: "preparing"), record(removed, udid: "stranger-iphone", status: "removing"), record(declined, udid: "friend-iphone", status: "ready")])
+    requests.fail(devices: shared, detail: "AppShelf did not build")
+    try expect(operations() == ["update-\(friendRequest)=failed", "update-\(removed)=remove-failed"], "A failed share run stops in visible states")
+    try expect(MockShelfProtocol.workerUpdates == ["\(friendRequest)=failed"], "Visitors who can already install AppShelf are not told it failed")
 
     reset(rows: [], records: [record("good", udid: "a", status: "waiting"), ["recordName": "broken", "recordChangeTag": "tag", "fields": [:]]])
     try expect(try requests.records().map(\.name) == ["good"], "One malformed record cannot block every other request")
+
+    var memory = ShelfResignMemory(failures: [:])
+    let start = Date(timeIntervalSince1970: 1_000_000)
+    let application = ShelfApplication(name: "Magic Touch", bundleIdentifier: "com.lucaswkuipers.MagicTouch", version: "4.0", build: "14", minimumOSVersion: "27.0", profileExpiration: .distantFuture, sourceCommit: "commit", sha256: "digest", size: 1, packageAssetID: 1, publishedAt: start)
+    try expect(outstandingResigns(ShelfCatalog(schema: 1, applications: [application], invitation: nil), devices: shared, memory: memory, at: start).count == 1, "Apps signed for an older device set need re-signing")
+    memory.record(application, devices: shared, reason: "build failed", at: start)
+    try expect(memory.blocks(application, devices: shared, at: start.addingTimeInterval(1799)) && !memory.blocks(application, devices: shared, at: start.addingTimeInterval(1801)), "The first retry waits 30 minutes")
+    memory.record(application, devices: shared, reason: "build failed", at: start)
+    memory.record(application, devices: shared, reason: "build failed", at: start)
+    try expect(memory.failures[application.bundleIdentifier]?.attempts == 3 && memory.blocks(application, devices: shared, at: start.addingTimeInterval(7199)), "Retries back off exponentially")
+    for _ in 0..<10 {
+        memory.record(application, devices: shared, reason: "build failed", at: start)
+    }
+    try expect(!memory.blocks(application, devices: shared, at: start.addingTimeInterval(86401)), "Retries happen at least daily")
+    var changed = application
+    changed.deviceSet = nil
+    let other = ShelfDevices(configuration: owner, sharing: ShelfSharing(devices: [friend, ShelfSharedDevice(id: "OTHERPHONE", udid: "other", name: "Other")], inviteGist: nil))
+    try expect(!memory.blocks(changed, devices: other, at: start), "A new device set retries right away")
+    try expect(shelfDisplayName("\u{202E}\u{1B}") == "iPhone" && shelfDisplayName("  Alex’s iPhone  ") == "Alex’s iPhone", "Display names keep readable text only")
 }

@@ -213,7 +213,7 @@ func refreshShelf() throws {
     let store = try ShelfStore()
     let catalog = try withShelfLock { try store.refresh() }
     try emit(["result": "shelf-links-refreshed", "apps": String(catalog.applications.count)])
-    processShelfRequests()
+    processShelfRequests(store: store)
     installShelfApplications(catalog, store: store)
 }
 
@@ -251,7 +251,13 @@ func deliverDirect(directory: String) throws {
     let descriptor = open(lockDirectory.appendingPathComponent("\(metadata.bundleIdentifier).lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
     guard descriptor >= 0 else { throw CommandError(message: "Cannot open delivery lock.") }
     defer { close(descriptor) }
-    guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else { throw CommandError(message: "Another delivery is already running for this app.") }
+    let lockDeadline = Date().addingTimeInterval(1800)
+    while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+        guard errno == EWOULDBLOCK, Date() < lockDeadline else {
+            throw CommandError(message: "Another delivery of this app has been running for over 30 minutes.")
+        }
+        Thread.sleep(forTimeInterval: 2)
+    }
     let store = try ShelfStore()
     let devices = try ShelfDevices.load()
     _ = try store.github.repository(name: metadata.name)
@@ -332,7 +338,8 @@ func deliverDirect(directory: String) throws {
             throw CommandError(message: "A newer build is already available in the shelf. It was preserved.")
         }
         let currentMain = try store.github.call(["api", "repos/lucaswkuipers/\(metadata.name)/git/ref/heads/main", "--jq", ".object.sha"])
-        guard currentMain == commit else {
+        let resigningCatalogedCommit = latest.applications.first(where: { $0.bundleIdentifier == application.bundleIdentifier })?.sourceCommit == commit
+        guard currentMain == commit || resigningCatalogedCommit else {
             throw CommandError(message: "Main has a newer commit. This build was retained in release history without replacing the current shelf app.")
         }
         updated.applications.removeAll { $0.bundleIdentifier == application.bundleIdentifier }

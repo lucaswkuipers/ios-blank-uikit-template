@@ -103,15 +103,29 @@ func setupDirect(options: Options) throws {
     try emit(["result": "personal-direct-signing-ready", "team": TestFlightConfiguration.personalTeam, "device": deviceName])
 }
 
-func verifyDirectProfile(_ profile: [String: Any], bundle: String, devices: [String]) throws -> Date {
+enum ShelfProvisioning {
+    case exactly([String])
+    case including(String)
+
+    func accepts(_ provisioned: [String]) -> Bool {
+        switch self {
+        case .exactly(let devices):
+            return provisioned.count == devices.count && Set(provisioned) == Set(devices)
+        case .including(let device):
+            return provisioned.contains { $0.caseInsensitiveCompare(device) == .orderedSame }
+        }
+    }
+}
+
+func verifyDirectProfile(_ profile: [String: Any], bundle: String, provisioning: ShelfProvisioning) throws -> Date {
     guard profile["TeamIdentifier"] as? [String] == [TestFlightConfiguration.personalTeam],
-          let provisioned = profile["ProvisionedDevices"] as? [String], provisioned.count == devices.count, Set(provisioned) == Set(devices),
+          let provisioned = profile["ProvisionedDevices"] as? [String], provisioning.accepts(provisioned),
           profile["ProvisionsAllDevices"] as? Bool != true,
           let entitlements = profile["Entitlements"] as? [String: Any],
           entitlements["application-identifier"] as? String == "\(TestFlightConfiguration.personalTeam).\(bundle)",
           entitlements["get-task-allow"] as? Bool == false,
           let expiration = profile["ExpirationDate"] as? Date, expiration > Date().addingTimeInterval(86400) else {
-        throw CommandError(message: "Direct distribution requires an unexpired personal Ad Hoc profile containing exactly the shelf's iPhones.")
+        throw CommandError(message: "Direct distribution requires an unexpired personal Ad Hoc profile for the expected shelf iPhones.")
     }
     return expiration
 }
@@ -148,7 +162,7 @@ func directProfile(client: AppStoreClient, configuration: DirectConfiguration, d
     guard let values = try PropertyListSerialization.propertyList(from: Data(decoded.utf8), format: nil) as? [String: Any], let uuid = values["UUID"] as? String else {
         throw CommandError(message: "Cannot decode the direct-distribution profile.")
     }
-    _ = try verifyDirectProfile(values, bundle: metadata.bundleIdentifier, devices: devices.udids)
+    _ = try verifyDirectProfile(values, bundle: metadata.bundleIdentifier, provisioning: .exactly(devices.udids))
     let installed = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Developer/Xcode/UserData/Provisioning Profiles")
     try files.createDirectory(at: installed, withIntermediateDirectories: true)
     try data.write(to: installed.appendingPathComponent("\(uuid).mobileprovision"), options: .atomic)
@@ -222,7 +236,7 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
     let archive = cache.appendingPathComponent("Direct.xcarchive")
     if files.fileExists(atPath: archive.path) { try files.removeItem(at: archive) }
     status("Archiving \(metadata.name) build \(build) for \(devices.udids.count) shelf iPhones…")
-    try run("/usr/bin/xcodebuild", projectArguments + ["-destination", "generic/platform=iOS", "-derivedDataPath", cache.deletingLastPathComponent().appendingPathComponent("DerivedData").path, "-archivePath", archive.path, "-quiet", "archive", "CURRENT_PROJECT_VERSION=\(build)", "DEVELOPMENT_TEAM=\(TestFlightConfiguration.personalTeam)", "CODE_SIGN_STYLE=Manual", "CODE_SIGN_IDENTITY=\(configuration.certificateSHA1)", "PROVISIONING_PROFILE_SPECIFIER=\(profile)"], log: cache.appendingPathComponent("archive.log"))
+    try run("/usr/bin/xcodebuild", projectArguments + ["-destination", "generic/platform=iOS", "-derivedDataPath", files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/Direct/\(metadata.name)/DerivedData").path, "-archivePath", archive.path, "-quiet", "archive", "CURRENT_PROJECT_VERSION=\(build)", "DEVELOPMENT_TEAM=\(TestFlightConfiguration.personalTeam)", "CODE_SIGN_STYLE=Manual", "CODE_SIGN_IDENTITY=\(configuration.certificateSHA1)", "PROVISIONING_PROFILE_SPECIFIER=\(profile)"], log: cache.appendingPathComponent("archive.log"))
     guard try sourceFingerprint(root) == fingerprint else {
         throw CommandError(message: "Sources changed during the archive. Finish edits and rerun; no package was published.")
     }
@@ -260,7 +274,7 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
             throw CommandError(message: "Export changed the app's CloudKit or push environment.")
         }
     }
-    let expiration = try verifyDirectProfile(profileValues, bundle: metadata.bundleIdentifier, devices: devices.udids)
+    let expiration = try verifyDirectProfile(profileValues, bundle: metadata.bundleIdentifier, provisioning: .exactly(devices.udids))
     let data = try Data(contentsOf: package, options: .mappedIfSafe)
     let result = DirectPackage(name: information["CFBundleDisplayName"] as? String ?? metadata.name, bundleIdentifier: metadata.bundleIdentifier, version: version, build: build, minimumOSVersion: minimumOSVersion, profileExpiration: expiration, fingerprint: fingerprint, path: package.path, sha256: SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(), size: data.count, devices: devices.identifier)
     try JSONEncoder().encode(result).write(to: state, options: .atomic)
