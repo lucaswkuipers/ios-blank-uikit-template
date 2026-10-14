@@ -358,7 +358,7 @@ func resignedShelfPackage(_ current: ShelfApplication, name: String, store: Shel
     let capabilityRevision = nameParts.count == 3 ? " \(nameParts[2])" : ""
     let client = try AppStoreClient(configuration: TestFlightConfiguration.load())
     try client.verifyPersonalAccount()
-    _ = try directProfile(client: client, configuration: configuration, devices: devices, metadata: Project(name: name, bundleIdentifier: current.bundleIdentifier, delivery: .shelf), cache: work, capabilityRevision: capabilityRevision)
+    _ = try directProfile(client: client, configuration: configuration, devices: devices, metadata: Project(name: name, bundleIdentifier: current.bundleIdentifier, delivery: .shelf, xcodeProject: nil, scheme: nil, prepareScript: nil), cache: work, capabilityRevision: capabilityRevision)
     let replacement = work.appendingPathComponent("Direct.mobileprovision")
     let updated = try profile(at: replacement)
     guard let previousEntitlements = previous["Entitlements"] as? NSDictionary, let updatedEntitlements = updated["Entitlements"] as? NSDictionary, previousEntitlements.isEqual(updatedEntitlements) else {

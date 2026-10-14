@@ -7,6 +7,9 @@ struct Project: Codable {
     let name: String
     let bundleIdentifier: String
     let delivery: DeliveryRoute?
+    let xcodeProject: String?
+    let scheme: String?
+    let prepareScript: String?
 
     var route: DeliveryRoute { delivery ?? .testflight }
 }

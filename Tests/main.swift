@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import ImageIO
 
 final class MockAppleProtocol: URLProtocol {
     static var responses: [Int] = []
@@ -41,6 +42,59 @@ do {
     try testShelfInstalls(directory: temporary)
     try testShelfSharing(directory: temporary)
     try testShelfRequests(directory: temporary)
+
+    let signingProject = temporary.appendingPathComponent("Example.xcodeproj")
+    try files.createDirectory(at: signingProject, withIntermediateDirectories: true)
+    let signingObjects: [String: [String: Any]] = [
+        "app": ["isa": "PBXNativeTarget", "name": "Example", "productType": "com.apple.product-type.application", "dependencies": ["widgetDependency", "frameworkDependency"]],
+        "widgetDependency": ["target": "widget"],
+        "widget": ["isa": "PBXNativeTarget", "name": "Widget", "productType": "com.apple.product-type.app-extension", "dependencies": ["watchDependency"]],
+        "watchDependency": ["target": "watch"],
+        "watch": ["isa": "PBXNativeTarget", "name": "Watch", "productType": "com.apple.product-type.application.watchapp2", "dependencies": []],
+        "frameworkDependency": ["target": "framework"],
+        "framework": ["isa": "PBXNativeTarget", "name": "Framework", "productType": "com.apple.product-type.framework", "dependencies": []],
+        "unrelated": ["isa": "PBXNativeTarget", "name": "OtherApp", "productType": "com.apple.product-type.application", "dependencies": []]
+    ]
+    try PropertyListSerialization.data(fromPropertyList: ["objects": signingObjects], format: .xml, options: 0).write(to: signingProject.appendingPathComponent("project.pbxproj"))
+    try expect(try directEmbeddedTargets(project: signingProject, name: "Example") == ["Watch", "Widget"], "Sign only reachable embedded apps and extensions, excluding frameworks and unrelated targets")
+    try expect(try directProfileVariable("com.lucaswkuipers.Example.widget") == "SHELF_PROFILE_com_lucaswkuipers_Example_widget", "Bundle signing variables must match Xcode identifier expansion")
+    try expectFailure { _ = try directProfileVariable("com.example.\nInjected = value") }
+
+    let unity = temporary.appendingPathComponent("UnitySource")
+    try files.createDirectory(at: unity.appendingPathComponent("ProjectSettings"), withIntermediateDirectories: true)
+    try files.createDirectory(at: unity.appendingPathComponent("Library"), withIntermediateDirectories: true)
+    try "2022.3.7f1".write(to: unity.appendingPathComponent("ProjectSettings/ProjectVersion.txt"), atomically: true, encoding: .utf8)
+    let unityFingerprint = try sourceFingerprint(unity)
+    try "cache".write(to: unity.appendingPathComponent("Library/generated"), atomically: true, encoding: .utf8)
+    try expect(try sourceFingerprint(unity) == unityFingerprint, "Unity-generated caches must not change the source fingerprint")
+    try "2022.3.8f1".write(to: unity.appendingPathComponent("ProjectSettings/ProjectVersion.txt"), atomically: true, encoding: .utf8)
+    try expect(try sourceFingerprint(unity) != unityFingerprint, "Unity project settings remain part of the source fingerprint")
+
+    var pixels = Data(count: 128 * 128 * 4)
+    var random: UInt32 = 1
+    for index in pixels.indices {
+        random = random &* 1664525 &+ 1013904223
+        pixels[index] = index % 4 == 3 ? 255 : UInt8(truncatingIfNeeded: random >> 16)
+    }
+    let iconProvider = CGDataProvider(data: pixels as CFData)!
+    let iconImage = CGImage(width: 128, height: 128, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 512, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue), provider: iconProvider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)!
+    let iconData = NSMutableData()
+    let iconDestination = CGImageDestinationCreateWithData(iconData, "public.png" as CFString, 1, nil)!
+    CGImageDestinationAddImage(iconDestination, iconImage, nil)
+    try expect(CGImageDestinationFinalize(iconDestination), "Create the noisy catalog icon fixture")
+    let catalogApps = (0..<10).map { index in
+        ShelfApplication(name: "App \(index)", bundleIdentifier: "com.lucaswkuipers.App\(index)", version: "1.0", build: "1", minimumOSVersion: "27.0", profileExpiration: .distantFuture, sourceCommit: "commit", sha256: "digest", size: 42, packageAssetID: index + 1, publishedAt: .distantPast, manifestAssetID: index + 100, installExpiration: .distantFuture, iconPNG: (iconData as Data).base64EncodedString())
+    }
+    let oversizedCatalog = ShelfCatalog(schema: 1, applications: catalogApps, invitation: "https://example.com/invite")
+    let compactCatalogData = try shelfCatalogData(oversizedCatalog, encoder: JSONEncoder())
+    let compactCatalog = try JSONDecoder().decode(ShelfCatalog.self, from: compactCatalogData)
+    try expect(compactCatalogData.count <= 100_000, "Catalog thumbnails must leave headroom below GitHub's release body limit")
+    try expect(compactCatalog.applications.map(\.manifestAssetID) == catalogApps.map(\.manifestAssetID) && compactCatalog.invitation == oversizedCatalog.invitation, "Compacting icons preserves installation links and the invitation")
+    for app in compactCatalog.applications {
+        try expect(CGImageSourceCreateWithData(Data(base64Encoded: app.iconPNG!)! as CFData, nil) != nil, "Compacted icons remain decodable images")
+    }
+    let smallCatalog = ShelfCatalog(schema: 1, applications: [catalogApps[0]], invitation: nil)
+    try expect(try shelfCatalogData(smallCatalog, encoder: JSONEncoder()) == JSONEncoder().encode(smallCatalog), "Catalogs below the budget retain their original thumbnails")
 
     let personal: [String: Any] = ["DEVELOPMENT_TEAM": "AR7T5G5Z83", "PRODUCT_BUNDLE_IDENTIFIER": "com.lucaswkuipers.Test", "CODE_SIGN_STYLE": "Automatic"]
     let legacyProject = try JSONDecoder().decode(Project.self, from: Data(#"{"name":"Test","bundleIdentifier":"com.lucaswkuipers.Test"}"#.utf8))

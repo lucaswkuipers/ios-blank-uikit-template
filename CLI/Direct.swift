@@ -183,6 +183,38 @@ struct DirectPackage: Codable {
     let devices: String
 }
 
+func directEmbeddedTargets(project: URL, name: String) throws -> [String] {
+    let json = try run("/usr/bin/plutil", ["-convert", "json", "-o", "-", project.appendingPathComponent("project.pbxproj").path], log: nil)
+    guard let document = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
+          let objects = document["objects"] as? [String: [String: Any]],
+          let application = objects.first(where: { $0.value["isa"] as? String == "PBXNativeTarget" && $0.value["name"] as? String == name }) else {
+        throw CommandError(message: "Cannot find the application's target in its Xcode project.")
+    }
+    var pending = [application.key]
+    var visited = Set<String>()
+    var names: [String] = []
+    while let identifier = pending.popLast() {
+        guard visited.insert(identifier).inserted, let target = objects[identifier] else { continue }
+        for dependency in target["dependencies"] as? [String] ?? [] {
+            guard let child = objects[dependency]?["target"] as? String else {
+                throw CommandError(message: "External project dependencies need explicit signing support.")
+            }
+            pending.append(child)
+        }
+        guard identifier != application.key,
+              let product = target["productType"] as? String,
+              product == "com.apple.product-type.app-extension" || product.hasPrefix("com.apple.product-type.application"),
+              let targetName = target["name"] as? String else { continue }
+        names.append(targetName)
+    }
+    return names.sorted()
+}
+
+func directProfileVariable(_ bundle: String) throws -> String {
+    try validate(bundle, pattern: "^[A-Za-z][A-Za-z0-9.-]*$", label: "bundle identifier")
+    return "SHELF_PROFILE_" + bundle.replacingOccurrences(of: ".", with: "_").replacingOccurrences(of: "-", with: "_")
+}
+
 func packageDirect(directory: String, build: String) throws -> DirectPackage {
     _ = try nextBuildNumber(build)
     let root = URL(fileURLWithPath: directory).standardizedFileURL.resolvingSymlinksInPath()
@@ -195,6 +227,17 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
     let devices = ShelfDevices(configuration: configuration, sharing: try ShelfSharing.load())
     let client = try AppStoreClient(configuration: TestFlightConfiguration.load())
     try client.verifyPersonalAccount()
+    if let path = metadata.prepareScript {
+        let script = root.appendingPathComponent(path).standardizedFileURL.resolvingSymlinksInPath()
+        guard script.path.hasPrefix(root.path + "/"), script.pathExtension == "swift" else {
+            throw CommandError(message: "The build preparation script must be a Swift file inside the app repository.")
+        }
+        status("Preparing \(metadata.name)'s Xcode project…")
+        try run("/usr/bin/swift", [script.path], log: nil)
+        guard try PersonalGitHub().git(root, ["status", "--porcelain"], remote: false).isEmpty else {
+            throw CommandError(message: "Build preparation changed tracked sources. Commit the generated source changes before publishing.")
+        }
+    }
     let fingerprint = try sourceFingerprint(root)
     let cache = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/Direct/\(metadata.name)/\(configuration.certificateID)-\(devices.identifier)/\(fingerprint.prefix(16))-\(build)")
     try files.createDirectory(at: cache, withIntermediateDirectories: true)
@@ -209,11 +252,19 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
        SHA256.hash(data: package).map({ String(format: "%02x", $0) }).joined() == saved.sha256 {
         return saved
     }
-    let projectArguments = ["-project", root.appendingPathComponent("\(metadata.name).xcodeproj").path, "-scheme", metadata.name, "-configuration", "Release"]
+    let project = root.appendingPathComponent(metadata.xcodeProject ?? "\(metadata.name).xcodeproj").standardizedFileURL.resolvingSymlinksInPath()
+    guard project.path.hasPrefix(root.path + "/"), project.pathExtension == "xcodeproj" else {
+        throw CommandError(message: "The Xcode project must be inside the app repository.")
+    }
+    let scheme = metadata.scheme ?? metadata.name
+    let projectArguments = ["-project", project.path, "-scheme", scheme, "-configuration", "Release"]
     let settingsJSON = try run("/usr/bin/xcodebuild", projectArguments + ["-destination", "generic/platform=iOS", "-showBuildSettings", "-json"], log: nil, separateError: true)
-    guard let targets = try JSONSerialization.jsonObject(with: Data(settingsJSON.utf8)) as? [[String: Any]], targets.count == 1,
-          let settings = targets.first?["buildSettings"] as? [String: Any] else {
-        throw CommandError(message: "Direct packaging currently requires one application target; extension profiles need explicit support.")
+    guard let targets = try JSONSerialization.jsonObject(with: Data(settingsJSON.utf8)) as? [[String: Any]] else {
+        throw CommandError(message: "Cannot read the app's build settings.")
+    }
+    let applications = targets.compactMap { $0["buildSettings"] as? [String: Any] }.filter { $0["PRODUCT_TYPE"] as? String == "com.apple.product-type.application" }
+    guard applications.count == 1, let settings = applications.first else {
+        throw CommandError(message: "Direct packaging requires one main application target in the selected scheme.")
     }
     try verifyPersonalSettings(settings, expectedBundle: metadata.bundleIdentifier)
     var entitlements: [String: Any] = [:]
@@ -233,15 +284,47 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
         capabilityRevision = ""
     }
     let profile = try directProfile(client: client, configuration: configuration, devices: devices, metadata: metadata, cache: cache, capabilityRevision: capabilityRevision)
+    var profiles = [metadata.bundleIdentifier: profile]
+    for target in try directEmbeddedTargets(project: project, name: settings["TARGET_NAME"] as? String ?? scheme) {
+        let json = try run("/usr/bin/xcodebuild", ["-project", project.path, "-target", target, "-configuration", "Release", "-showBuildSettings", "-json"], log: nil, separateError: true)
+        guard let targets = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: Any]],
+              let settings = targets.first(where: { $0["target"] as? String == target })?["buildSettings"] as? [String: Any],
+              let bundle = settings["PRODUCT_BUNDLE_IDENTIFIER"] as? String,
+              bundle.hasPrefix(metadata.bundleIdentifier + "."), profiles[bundle] == nil else {
+            throw CommandError(message: "Embedded target must have its own bundle identifier beneath the application identifier.")
+        }
+        try verifyPersonalSettings(settings, expectedBundle: bundle)
+        let targetCache = cache.appendingPathComponent(bundle)
+        try files.createDirectory(at: targetCache, withIntermediateDirectories: true)
+        var revision = ""
+        if let path = settings["CODE_SIGN_ENTITLEMENTS"] as? String, !path.isEmpty {
+            let data = try Data(contentsOf: root.appendingPathComponent(path))
+            revision = " " + SHA256.hash(data: data).prefix(6).map { String(format: "%02x", $0) }.joined()
+        }
+        profiles[bundle] = try directProfile(client: client, configuration: configuration, devices: devices, metadata: Project(name: target, bundleIdentifier: bundle, delivery: .shelf, xcodeProject: nil, scheme: nil, prepareScript: nil), cache: targetCache, capabilityRevision: revision)
+    }
+    var signingArguments = ["PROVISIONING_PROFILE_SPECIFIER=\(profile)"]
+    if profiles.count > 1 || metadata.xcodeProject != nil {
+        var variables = Set<String>()
+        var lines = ["PROVISIONING_PROFILE_SPECIFIER = $(SHELF_PROFILE_$(PRODUCT_BUNDLE_IDENTIFIER:c99extidentifier))"]
+        for bundle in profiles.keys.sorted() {
+            let variable = try directProfileVariable(bundle)
+            guard variables.insert(variable).inserted else { throw CommandError(message: "Embedded bundle identifiers have conflicting signing variables.") }
+            lines.append("\(variable) = \(profiles[bundle]!)")
+        }
+        let configuration = cache.appendingPathComponent("Signing.xcconfig")
+        try lines.joined(separator: "\n").write(to: configuration, atomically: true, encoding: .utf8)
+        signingArguments = ["-xcconfig", configuration.path]
+    }
     let archive = cache.appendingPathComponent("Direct.xcarchive")
     if files.fileExists(atPath: archive.path) { try files.removeItem(at: archive) }
     status("Archiving \(metadata.name) build \(build) for \(devices.udids.count) shelf iPhones…")
-    try run("/usr/bin/xcodebuild", projectArguments + ["-destination", "generic/platform=iOS", "-derivedDataPath", files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/Direct/\(metadata.name)/DerivedData").path, "-archivePath", archive.path, "-quiet", "archive", "CURRENT_PROJECT_VERSION=\(build)", "DEVELOPMENT_TEAM=\(TestFlightConfiguration.personalTeam)", "CODE_SIGN_STYLE=Manual", "CODE_SIGN_IDENTITY=\(configuration.certificateSHA1)", "PROVISIONING_PROFILE_SPECIFIER=\(profile)"], log: cache.appendingPathComponent("archive.log"))
+    try run("/usr/bin/xcodebuild", projectArguments + ["-destination", "generic/platform=iOS", "-derivedDataPath", files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/Direct/\(metadata.name)/DerivedData").path, "-archivePath", archive.path, "-quiet", "archive", "CURRENT_PROJECT_VERSION=\(build)", "DEVELOPMENT_TEAM=\(TestFlightConfiguration.personalTeam)", "CODE_SIGN_STYLE=Manual", "CODE_SIGN_IDENTITY=\(configuration.certificateSHA1)"] + signingArguments, log: cache.appendingPathComponent("archive.log"))
     guard try sourceFingerprint(root) == fingerprint else {
         throw CommandError(message: "Sources changed during the archive. Finish edits and rerun; no package was published.")
     }
     let export = cache.appendingPathComponent("Export")
-    var options: [String: Any] = ["method": "release-testing", "destination": "export", "signingStyle": "manual", "teamID": TestFlightConfiguration.personalTeam, "signingCertificate": configuration.certificateSHA1, "provisioningProfiles": [metadata.bundleIdentifier: profile], "manageAppVersionAndBuildNumber": false, "stripSwiftSymbols": true, "thinning": "<none>"]
+    var options: [String: Any] = ["method": "release-testing", "destination": "export", "signingStyle": "manual", "teamID": TestFlightConfiguration.personalTeam, "signingCertificate": configuration.certificateSHA1, "provisioningProfiles": profiles, "manageAppVersionAndBuildNumber": false, "stripSwiftSymbols": true, "thinning": "<none>"]
     if let cloudEnvironment { options["iCloudContainerEnvironment"] = cloudEnvironment }
     let optionsFile = cache.appendingPathComponent("ExportOptions.plist")
     try PropertyListSerialization.data(fromPropertyList: options, format: .xml, options: 0).write(to: optionsFile, options: .atomic)
@@ -274,7 +357,28 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
             throw CommandError(message: "Export changed the app's CloudKit or push environment.")
         }
     }
-    let expiration = try verifyDirectProfile(profileValues, bundle: metadata.bundleIdentifier, provisioning: .exactly(devices.udids))
+    var expiration = try verifyDirectProfile(profileValues, bundle: metadata.bundleIdentifier, provisioning: .exactly(devices.udids))
+    var verifiedBundles = Set([metadata.bundleIdentifier])
+    guard let contents = files.enumerator(at: application, includingPropertiesForKeys: nil) else {
+        throw CommandError(message: "Cannot inspect embedded application bundles.")
+    }
+    for case let embedded as URL in contents where embedded.pathExtension == "app" || embedded.pathExtension == "appex" {
+        guard let info = try PropertyListSerialization.propertyList(from: Data(contentsOf: embedded.appendingPathComponent("Info.plist")), format: nil) as? [String: Any],
+              let bundle = info["CFBundleIdentifier"] as? String, profiles[bundle] != nil,
+              verifiedBundles.insert(bundle).inserted,
+              info["CFBundleVersion"] as? String == build else {
+            throw CommandError(message: "Unexpected embedded app identity or build number.")
+        }
+        try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", embedded.path], log: nil)
+        let decoded = try run("/usr/bin/security", ["cms", "-D", "-i", embedded.appendingPathComponent("embedded.mobileprovision").path], log: nil, separateError: true)
+        guard let values = try PropertyListSerialization.propertyList(from: Data(decoded.utf8), format: nil) as? [String: Any] else {
+            throw CommandError(message: "Cannot decode an embedded app's provisioning profile.")
+        }
+        expiration = min(expiration, try verifyDirectProfile(values, bundle: bundle, provisioning: .exactly(devices.udids)))
+    }
+    guard verifiedBundles == Set(profiles.keys) else {
+        throw CommandError(message: "The export is missing an expected embedded application.")
+    }
     let data = try Data(contentsOf: package, options: .mappedIfSafe)
     let result = DirectPackage(name: information["CFBundleDisplayName"] as? String ?? metadata.name, bundleIdentifier: metadata.bundleIdentifier, version: version, build: build, minimumOSVersion: minimumOSVersion, profileExpiration: expiration, fingerprint: fingerprint, path: package.path, sha256: SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(), size: data.count, devices: devices.identifier)
     try JSONEncoder().encode(result).write(to: state, options: .atomic)

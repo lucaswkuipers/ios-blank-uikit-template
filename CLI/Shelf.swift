@@ -28,6 +28,40 @@ struct ShelfCatalog: Codable {
     var invitation: String?
 }
 
+func shelfCatalogData(_ value: ShelfCatalog, encoder: JSONEncoder) throws -> Data {
+    var catalog = value
+    var data = try encoder.encode(catalog)
+    var exhausted = Set<Int>()
+    while data.count > 100_000 {
+        guard let index = catalog.applications.indices.filter({ !exhausted.contains($0) && catalog.applications[$0].iconPNG != nil }).max(by: { (catalog.applications[$0].iconPNG?.count ?? 0) < (catalog.applications[$1].iconPNG?.count ?? 0) }),
+              let encoded = catalog.applications[index].iconPNG,
+              let icon = Data(base64Encoded: encoded),
+              let source = CGImageSourceCreateWithData(icon as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int else {
+            throw CommandError(message: "The catalog exceeds GitHub's release-description budget and its icons cannot be reduced further.")
+        }
+        let dimension = max(width, height)
+        if dimension <= 32 {
+            exhausted.insert(index)
+            continue
+        }
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: max(32, dimension * 3 / 4)] as CFDictionary) else {
+            throw CommandError(message: "Cannot resize a catalog thumbnail.")
+        }
+        let thumbnail = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(thumbnail, "public.png" as CFString, 1, nil) else {
+            throw CommandError(message: "Cannot encode a catalog thumbnail.")
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else { throw CommandError(message: "Cannot finish a catalog thumbnail.") }
+        catalog.applications[index].iconPNG = (thumbnail as Data).base64EncodedString()
+        data = try encoder.encode(catalog)
+    }
+    return data
+}
+
 struct ShelfDeliveryState: Codable {
     let commit: String
     let build: String
@@ -118,7 +152,8 @@ struct ShelfStore {
     func updateBody<T: Encodable>(_ value: T, releaseID: Int) throws {
         let temporary = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? files.removeItem(at: temporary) }
-        let body = String(decoding: try encoder.encode(value), as: UTF8.self)
+        let data = try (value as? ShelfCatalog).map { try shelfCatalogData($0, encoder: encoder) } ?? encoder.encode(value)
+        let body = String(decoding: data, as: UTF8.self)
         try JSONSerialization.data(withJSONObject: ["body": body]).write(to: temporary, options: .atomic)
         try github.call(["api", "--method", "PATCH", "repos/\(Self.repository)/releases/\(releaseID)", "--input", temporary.path])
     }

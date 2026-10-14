@@ -76,7 +76,7 @@ func create(name: String, options: Options) throws {
     """
     try scheme.write(to: schemes.appendingPathComponent("\(name).xcscheme"), atomically: true, encoding: .utf8)
     try files.copyItem(at: repository.appendingPathComponent(".gitignore"), to: staging.appendingPathComponent(".gitignore"))
-    let metadata = Project(name: name, bundleIdentifier: bundleIdentifier, delivery: delivery)
+    let metadata = Project(name: name, bundleIdentifier: bundleIdentifier, delivery: delivery, xcodeProject: nil, scheme: nil, prepareScript: nil)
     try JSONEncoder().encode(metadata).write(to: staging.appendingPathComponent(".uikit-app.json"))
     let instructions = """
     # \(name)

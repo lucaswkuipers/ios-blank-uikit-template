@@ -187,6 +187,7 @@ struct DeliveryState: Codable {
 }
 
 func sourceFingerprint(_ root: URL) throws -> String {
+    let unityProject = files.fileExists(atPath: root.appendingPathComponent("ProjectSettings/ProjectVersion.txt").path)
     var enumerationError: Error?
     guard let enumerator = files.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [], errorHandler: { _, error in
         enumerationError = error
@@ -196,6 +197,7 @@ func sourceFingerprint(_ root: URL) throws -> String {
     }
     var paths: [URL] = []
     for case let url as URL in enumerator {
+        if unityProject, enumerator.level == 1, ["Library", "Temp", "Logs", "obj", "UserSettings"].contains(url.lastPathComponent) { enumerator.skipDescendants(); continue }
         if [".git", ".build", ".DS_Store", "xcuserdata", "build", "DerivedData"].contains(url.lastPathComponent) { enumerator.skipDescendants(); continue }
         if try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true { paths.append(url) }
     }
