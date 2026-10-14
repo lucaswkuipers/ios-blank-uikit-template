@@ -237,6 +237,7 @@ function page(env) {
   const opened = Date.now()
   let shown = ""
   let timer = null
+  let settingUp = null
   let request = parameters.get("request")
   try {
     if (request) {
@@ -273,6 +274,11 @@ function page(env) {
       item.textContent = instruction
       return item
     }))
+  }
+
+  function patience() {
+    settingUp = settingUp ?? Date.now()
+    return Date.now() - settingUp < 180000 ? "This usually takes about a minute. Keep this page open; it updates by itself." : "This is taking longer than usual. It needs " + owner + "'s Mac to be online, so this page keeps trying."
   }
 
   function schedule(delay) {
@@ -338,7 +344,7 @@ function page(env) {
     case "pending":
     case "approved":
     case "preparing":
-      show(greeting + "Setting up AppShelf for this iPhone…", "This usually takes about a minute. Keep this page open; it updates by itself.")
+      show(greeting + "Setting up AppShelf for this iPhone…", patience())
       schedule(5000)
       return
     case "waiting":
@@ -394,7 +400,7 @@ function page(env) {
       break
     case "approved":
     case "preparing":
-      show(owner + " approved this iPhone.", "Setting up AppShelf for this iPhone. This usually takes about a minute.")
+      show(owner + " approved this iPhone. Setting up AppShelf for it…", patience())
       break
     case "failed":
       show(owner + " approved this iPhone, but setup did not finish yet.", owner + " can see the problem and will try again. This page updates when it's ready.")
