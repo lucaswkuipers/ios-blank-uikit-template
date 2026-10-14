@@ -215,6 +215,24 @@ struct ShelfRequests {
         try modify(["operationType": "forceDelete", "record": ["recordName": name]])
     }
 
+    func note(_ message: String, person: String, failed: Bool) {
+        do {
+            try modify(["operationType": "create", "record": ["recordType": "ShelfActivity", "recordName": "activity-\(UUID().uuidString.lowercased())", "fields": ["message": ["value": String(message.prefix(500))], "person": ["value": person], "level": ["value": failed ? "error" : "info"]]]])
+        } catch {
+            status("Could not add to AppShelf's activity: \(error.localizedDescription)")
+        }
+    }
+
+    func pruneActivity() throws {
+        let cutoff = (Date().timeIntervalSince1970 - 30 * 86400) * 1000
+        let results = try cloud.records(operation: "query", body: ["query": ["recordType": "ShelfActivity", "sortBy": [["fieldName": "___createTime", "ascending": true]]], "resultsLimit": 200])
+        let expired = results.filter { (($0["created"] as? [String: Any])?["timestamp"] as? Double ?? .infinity) < cutoff }.compactMap { $0["recordName"] as? String }
+        guard !expired.isEmpty else {
+            return
+        }
+        _ = try cloud.records(operation: "modify", body: ["operations": expired.map { ["operationType": "forceDelete", "record": ["recordName": $0]] }])
+    }
+
     func isolate(_ record: ShelfAccessRecord, _ work: () throws -> Void) {
         do {
             try work()
@@ -234,6 +252,7 @@ struct ShelfRequests {
                 guard invitation.name.hasPrefix("invite-"), token.range(of: "^[0-9a-f]{32}$", options: .regularExpression) != nil, invitation.created > expiry else {
                     try delete(invitation.name)
                     status("Removed the unused invite for \(invitation.deviceName).")
+                    note("Unused invite expired after 7 days", person: shelfDisplayName(invitation.deviceName), failed: false)
                     return
                 }
                 active.insert(token)
@@ -243,6 +262,7 @@ struct ShelfRequests {
                 let profile = try sign("\(configuration.url)/enroll?invite=\(token)")
                 _ = try workerRequest("/admin/invites", body: ["token": token, "name": shelfDisplayName(invitation.deviceName), "profile": profile.base64EncodedString()])
                 status("Prepared the invite for \(invitation.deviceName).")
+                note("Invite is ready to open", person: shelfDisplayName(invitation.deviceName), failed: false)
             }
         }
         for invite in uploaded where invite.request == nil && !active.contains(invite.token) {
@@ -279,6 +299,7 @@ struct ShelfRequests {
                     }
                     try updateWorker(request.id, status: "ready")
                     status("\(deviceName) already has access; its new request page shows the install link.")
+                    note("Opened the link again on an iPhone that already has access; the page shows the install button", person: deviceName, failed: false)
                     continue
                 }
                 if let invitation {
@@ -291,6 +312,7 @@ struct ShelfRequests {
                     try updateWorker(request.id, status: "approved")
                     invited.append(request.id)
                     status("\(deviceName) opened their invite; adding their iPhone.")
+                    note("Installed the profile from their invite (\(shelfDisplayName(request.model)), build \(shelfDisplayName(request.systemVersion)))", person: deviceName, failed: false)
                     continue
                 }
                 if existing?.status == "approved" {
@@ -303,6 +325,7 @@ struct ShelfRequests {
                 }
                 try updateWorker(request.id, status: "waiting")
                 status("Asked the shelf owner to approve \(deviceName).")
+                note("Asked for access through the open link (\(shelfDisplayName(request.model)), build \(shelfDisplayName(request.systemVersion)))", person: deviceName, failed: false)
             } catch {
                 status("Could not pass on the request from \(deviceName); a later refresh retries: \(error.localizedDescription)")
             }
@@ -316,6 +339,7 @@ struct ShelfRequests {
                 isolate(record) {
                     try updateWorker(record.name, status: "ready")
                     try transition(record.name, from: ["preparing", "failed"], to: "ready", detail: "")
+                    note("Their page now shows Install AppShelf", person: record.deviceName, failed: false)
                 }
             }
         } catch {
@@ -338,8 +362,10 @@ struct ShelfRequests {
                     } else if !included && ["preparing", "ready", "shared", "remove", "removing", "remove-failed"].contains(record.status) {
                         try updateWorker(record.name, status: "removed")
                         try delete(record.name)
+                        note("Access removed", person: record.deviceName, failed: false)
                     } else if included && record.status == "removing" {
                         try transition(record.name, from: ["removing"], to: "remove-failed", detail: "This iPhone is still in the shelf's signing list.")
+                        note("Removal did not finish: this iPhone is still in the signing list", person: record.deviceName, failed: true)
                     }
                 }
             }
@@ -377,8 +403,10 @@ struct ShelfRequests {
                     if record.status == "preparing" && devices.includes(record.udid) {
                         try transition(record.name, from: ["preparing"], to: "failed", detail: detail)
                         try updateWorker(record.name, status: "failed")
+                        note("Setup failed: \(detail)", person: record.deviceName, failed: true)
                     } else if record.status == "removing" {
                         try transition(record.name, from: ["removing"], to: "remove-failed", detail: detail)
+                        note("Removal failed: \(detail)", person: record.deviceName, failed: true)
                     }
                 }
             }
@@ -394,6 +422,16 @@ func processShelfRequests() {
         let session = URLSession(configuration: .ephemeral, delegate: RejectRedirect(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
         if let requests = try ShelfRequests.load(session: session) {
+            let pruned = TestFlightConfiguration.directory.appendingPathComponent("shelf-activity.pruned")
+            let lastPruned = (try? files.attributesOfItem(atPath: pruned.path)[.modificationDate] as? Date) ?? .distantPast
+            if lastPruned < Date().addingTimeInterval(-3600) {
+                do {
+                    try requests.pruneActivity()
+                    try Data().write(to: pruned, options: .atomic)
+                } catch {
+                    status("Old activity is pruned on a later refresh: \(error.localizedDescription)")
+                }
+            }
             do {
                 try requests.syncInvites { try shelfRequestProfile(enrollment: $0) }
             } catch {
@@ -415,6 +453,7 @@ func processShelfRequests() {
                 requests.isolate(record) {
                     try requests.updateWorker(record.name, status: "declined")
                     try requests.delete(record.name)
+                    requests.note("You declined their request", person: record.deviceName, failed: false)
                 }
             }
             if let lock = try tryLockShelfShare() {
@@ -426,12 +465,14 @@ func processShelfRequests() {
                             added = try addShelfDevice(udid: record.udid, name: record.deviceName)
                         } catch {
                             status("Could not approve \(record.deviceName): \(error.localizedDescription)")
+                            requests.note("Could not register their iPhone with Apple: \(error.localizedDescription)", person: record.deviceName, failed: true)
                             if try requests.transition(record.name, from: [record.status], to: "failed", detail: error.localizedDescription) {
                                 try requests.updateWorker(record.name, status: "failed")
                             }
                             return
                         }
                         changed = changed || added
+                        requests.note(added ? "Registered their iPhone with Apple; re-signing every app" : "Their iPhone was already registered; refreshing their access", person: record.deviceName, failed: false)
                         if try requests.transition(record.name, from: [record.status], to: "preparing", detail: "") {
                             if record.status == "retry" {
                                 try ShelfResignMemory(failures: [:]).save()
@@ -455,6 +496,7 @@ func processShelfRequests() {
                         memory.failures["com.lucaswkuipers.AppShelf"] = nil
                         try memory.save()
                         try requests.transition(record.name, from: ["remove"], to: "removing", detail: "")
+                        requests.note("Removing access; re-signing every app without their iPhone", person: record.deviceName, failed: false)
                         changed = true
                     }
                 }

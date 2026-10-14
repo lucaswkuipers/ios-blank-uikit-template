@@ -89,8 +89,23 @@ func testShelfRequests(directory: URL) throws {
         MockShelfProtocol.cloudOperations = []
     }
 
+    func requestOperations() -> [[String: Any]] {
+        MockShelfProtocol.cloudOperations.filter { ($0["record"] as? [String: Any])?["recordType"] as? String != "ShelfActivity" }
+    }
+
+    func activity() -> [String] {
+        MockShelfProtocol.cloudOperations.compactMap { operation in
+            let record = operation["record"] as? [String: Any] ?? [:]
+            let fields = record["fields"] as? [String: Any] ?? [:]
+            guard record["recordType"] as? String == "ShelfActivity" else {
+                return nil
+            }
+            return "\((fields["person"] as? [String: Any])?["value"] ?? ""): \((fields["message"] as? [String: Any])?["value"] ?? "")"
+        }
+    }
+
     func operations() -> [String] {
-        MockShelfProtocol.cloudOperations.map { operation in
+        requestOperations().map { operation in
             let record = operation["record"] as? [String: Any] ?? [:]
             let fields = record["fields"] as? [String: Any] ?? [:]
             let status = (fields["status"] as? [String: Any])?["value"] as? String ?? ""
@@ -99,7 +114,7 @@ func testShelfRequests(directory: URL) throws {
     }
 
     func field(_ name: String, of index: Int) -> String? {
-        let record = MockShelfProtocol.cloudOperations[index]["record"] as? [String: Any]
+        let record = requestOperations()[index]["record"] as? [String: Any]
         return ((record?["fields"] as? [String: Any])?[name] as? [String: Any])?["value"] as? String
     }
 
@@ -132,6 +147,7 @@ func testShelfRequests(directory: URL) throws {
     let approved = try requests.relay(devices: shared)
     try expect(operations() == ["create-\(new)=approved", "forceDelete-invite-\(token)"] && field("deviceName", of: 0) == "Sam", "An invite approves its iPhone under the invited name and is used up")
     try expect(approved == [new], "The refresh learns which invites it approved, so it can start setup before CloudKit's query index catches up")
+    try expect(activity() == ["Sam: Installed the profile from their invite (iPhone17,1, build 24A335)"], "The owner's activity shows the invite being used")
     try expect(MockShelfProtocol.workerUpdates == ["\(new)=approved"], "The invited visitor sees setup start without waiting for the owner")
 
     reset(rows: [invited(new, udid: "stranger-iphone")], records: [record(new, udid: "stranger-iphone", status: "approved")])

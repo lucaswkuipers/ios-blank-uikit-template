@@ -122,10 +122,16 @@ func shareShelf(options: Options) throws {
     var shelfFailure: Error?
     do {
         let (_, catalog) = try store.catalog()
-        for bundleIdentifier in resignShelfPackages(outstandingResigns(catalog, devices: devices, memory: memory, at: Date()), store: store, devices: devices) {
+        let outstanding = outstandingResigns(catalog, devices: devices, memory: memory, at: Date())
+        let started = Date()
+        let resigned = resignShelfPackages(outstanding, store: store, devices: devices)
+        for bundleIdentifier in resigned {
             memory.failures[bundleIdentifier] = nil
         }
         try memory.save()
+        if !outstanding.isEmpty {
+            requests?.note("Re-signed \(resigned.count) of \(outstanding.count) apps for \(devices.udids.count) iPhones in \(Int(Date().timeIntervalSince(started))) s", person: "", failed: resigned.count < outstanding.count)
+        }
     } catch {
         status("Could not re-sign the shelf in one batch; each app is retried on its own: \(error.localizedDescription)")
     }
@@ -163,6 +169,9 @@ func shareShelf(options: Options) throws {
     } catch {
         requests?.fail(devices: devices, detail: error.localizedDescription)
         throw error
+    }
+    if !unavailable.isEmpty {
+        requests?.note("Not yet signed for every iPhone, retrying with backoff: \(unavailable.joined(separator: ", "))", person: "", failed: true)
     }
     if let shelfFailure {
         requests?.fail(devices: devices, detail: "AppShelf: \(shelfFailure.localizedDescription)")
