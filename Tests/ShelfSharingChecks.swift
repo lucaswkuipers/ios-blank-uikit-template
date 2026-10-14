@@ -26,8 +26,11 @@ func testShelfSharing(directory: URL) throws {
     let parsed = try ShelfAccessRecord(record)
     try expect(parsed.status == "approved" && parsed.detail.isEmpty && parsed.changeTag == "tag", "Access requests parse from CloudKit records")
     var incomplete = record
-    incomplete["fields"] = ["deviceName": ["value": "Alex"], "status": ["value": "approved"]]
+    incomplete["fields"] = ["udid": ["value": "udid"], "deviceName": ["value": "Alex"]]
     try expectFailure { _ = try ShelfAccessRecord(incomplete) }
+    var invitation = record
+    invitation["fields"] = ["deviceName": ["value": "Sam"], "status": ["value": "invited"]]
+    try expect(try ShelfAccessRecord(invitation).udid.isEmpty, "Invites parse before any iPhone uses them")
     try expect(try shelfInstallLink(manifestURL: "https://example.com/raw/AppShelf.plist") == "itms-services://?action=download-manifest&url=https://example.com/raw/AppShelf.plist", "Install links keep the manifest URL readable")
 
     let link = "itms-services://?action=download-manifest&url=https://gist.githubusercontent.com/lucaswkuipers/0123456789abcdef0123456789abcdef/raw/0123456789abcdef0123456789abcdef01234567/AppShelf.plist"

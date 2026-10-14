@@ -231,6 +231,102 @@ func resignShelfApplication(_ application: ShelfApplication, store: ShelfStore, 
     try validate(current.sourceCommit, pattern: "^[0-9a-f]{40}$", label: "cataloged source commit")
     let name = String(asset.name.dropLast(".ipa".count))
     _ = try store.github.repository(name: name)
+    do {
+        try resignShelfPackage(current, name: name, store: store, devices: devices)
+    } catch {
+        status("Rebuilding \(current.name) because its package could not be re-signed directly: \(error.localizedDescription)")
+        try rebuildShelfApplication(current, name: name, store: store, devices: devices)
+    }
+    let (_, updated) = try store.catalog()
+    guard let resigned = updated.applications.first(where: { $0.bundleIdentifier == application.bundleIdentifier }), devices.isCurrent(resigned) else {
+        throw CommandError(message: "The re-signed build of \(current.name) was not published for every shelf iPhone.")
+    }
+}
+
+func resignShelfPackage(_ current: ShelfApplication, name: String, store: ShelfStore, devices: ShelfDevices) throws {
+    let configuration = try DirectConfiguration.load()
+    let work = files.temporaryDirectory.appendingPathComponent("shelf-resign-\(UUID().uuidString)")
+    try files.createDirectory(at: work, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    defer { try? files.removeItem(at: work) }
+    status("Re-signing \(current.name) \(current.version) (\(current.build)) for \(devices.udids.count) iPhones…")
+    let original = try shelfInstallPackage(current, store: store, cache: work)
+    let unpacked = work.appendingPathComponent("Unpacked")
+    try run("/usr/bin/ditto", ["-x", "-k", original.path, unpacked.path], log: nil)
+    let payload = unpacked.appendingPathComponent("Payload")
+    guard try files.contentsOfDirectory(atPath: payload.path) == ["\(name).app"] else {
+        throw CommandError(message: "The package does not contain exactly \(name).app.")
+    }
+    let bundle = payload.appendingPathComponent("\(name).app")
+    let nested = ["Frameworks", "PlugIns", "Extensions", "Watch", "AppClips"].filter { files.fileExists(atPath: bundle.appendingPathComponent($0).path) }
+    guard nested.isEmpty else {
+        throw CommandError(message: "It contains \(nested.joined(separator: ", ")), which only a rebuild signs correctly.")
+    }
+    let embedded = bundle.appendingPathComponent("embedded.mobileprovision")
+    func profile(at path: URL) throws -> [String: Any] {
+        let decoded = try run("/usr/bin/security", ["cms", "-D", "-i", path.path], log: nil, separateError: true)
+        guard let values = try PropertyListSerialization.propertyList(from: Data(decoded.utf8), format: nil) as? [String: Any] else {
+            throw CommandError(message: "Cannot read the provisioning profile at \(path.lastPathComponent).")
+        }
+        return values
+    }
+    func entitlements() throws -> NSDictionary {
+        let signed = try run("/usr/bin/codesign", ["-d", "--entitlements", "-", "--xml", bundle.path], log: nil, separateError: true)
+        guard let values = try PropertyListSerialization.propertyList(from: Data(signed.utf8), format: nil) as? NSDictionary else {
+            throw CommandError(message: "Cannot read the signed entitlements.")
+        }
+        return values
+    }
+    let previous = try profile(at: embedded)
+    let prefix = "UIKit App \(current.bundleIdentifier) "
+    guard let previousName = previous["Name"] as? String, previousName.hasPrefix(prefix) else {
+        throw CommandError(message: "It was not signed with a UIKit App shelf profile.")
+    }
+    let nameParts = previousName.dropFirst(prefix.count).split(separator: " ")
+    guard nameParts.count == 2 || (nameParts.count == 3 && nameParts[2].range(of: "^[0-9a-f]{12}$", options: .regularExpression) != nil) else {
+        throw CommandError(message: "Its profile name \(previousName) has an unexpected form.")
+    }
+    let capabilityRevision = nameParts.count == 3 ? " \(nameParts[2])" : ""
+    let client = try AppStoreClient(configuration: TestFlightConfiguration.load())
+    try client.verifyPersonalAccount()
+    _ = try directProfile(client: client, configuration: configuration, devices: devices, metadata: Project(name: name, bundleIdentifier: current.bundleIdentifier, delivery: .shelf), cache: work, capabilityRevision: capabilityRevision)
+    let replacement = work.appendingPathComponent("Direct.mobileprovision")
+    let updated = try profile(at: replacement)
+    guard let previousEntitlements = previous["Entitlements"] as? NSDictionary, let updatedEntitlements = updated["Entitlements"] as? NSDictionary, previousEntitlements.isEqual(updatedEntitlements) else {
+        throw CommandError(message: "Its App ID capabilities changed since it was built.")
+    }
+    let signed = try entitlements()
+    let signedFile = work.appendingPathComponent("Entitlements.plist")
+    try PropertyListSerialization.data(fromPropertyList: signed, format: .xml, options: 0).write(to: signedFile)
+    try files.removeItem(at: embedded)
+    try files.copyItem(at: replacement, to: embedded)
+    try run("/usr/bin/codesign", ["--force", "--sign", configuration.certificateSHA1, "--entitlements", signedFile.path, "--generate-entitlement-der", "--timestamp=none", bundle.path], log: nil)
+    try verifyShelfInstall(bundle, application: current, provisioning: .exactly(devices.udids))
+    guard try entitlements().isEqual(signed) else {
+        throw CommandError(message: "Re-signing changed its entitlements.")
+    }
+    let expiration = try verifyDirectProfile(updated, bundle: current.bundleIdentifier, provisioning: .exactly(devices.udids))
+    let package = work.appendingPathComponent("\(name).ipa")
+    try run("/usr/bin/ditto", ["-c", "-k", "--norsrc", "--keepParent", payload.path, package.path], log: nil)
+    let data = try Data(contentsOf: package, options: .mappedIfSafe)
+    let sha256 = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    let intent = ["sourceCommit": current.sourceCommit, "bundleIdentifier": current.bundleIdentifier, "build": current.build, "deviceSet": devices.identifier]
+    let application = try publishShelfArtifact(store: store, tag: "\(name)-\(current.build)-\(current.sourceCommit.prefix(12))-\(devices.identifier)", title: "\(name) \(current.version) (\(current.build))", intent: intent, package: package, assetName: "\(name).ipa", size: data.count, sha256: sha256) { asset in
+        ShelfApplication(name: current.name, bundleIdentifier: current.bundleIdentifier, version: current.version, build: current.build, minimumOSVersion: current.minimumOSVersion, profileExpiration: expiration, sourceCommit: current.sourceCommit, sha256: sha256, size: data.count, packageAssetID: asset.id, publishedAt: current.publishedAt, manifestAssetID: nil, installExpiration: nil, iconPNG: current.iconPNG, notificationTitle: current.notificationTitle, deviceSet: devices.identifier, silent: true)
+    }
+    try withShelfLock {
+        let (release, latest) = try store.catalog()
+        guard let index = latest.applications.firstIndex(where: { $0.bundleIdentifier == current.bundleIdentifier }),
+              latest.applications[index].sourceCommit == current.sourceCommit, latest.applications[index].build == current.build else {
+            return
+        }
+        var catalog = latest
+        catalog.applications[index] = application
+        try store.updateBody(catalog, releaseID: release.id)
+        _ = try store.refresh()
+    }
+}
+
+func rebuildShelfApplication(_ current: ShelfApplication, name: String, store: ShelfStore, devices: ShelfDevices) throws {
     let capacity = try files.homeDirectoryForCurrentUser.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage ?? 0
     guard capacity > 3_000_000_000 else {
         throw CommandError(message: "Only \(capacity / 1_000_000) MB of disk space is free; re-signing needs at least 3 GB. Free some space; the share retries automatically.")
@@ -265,12 +361,8 @@ func resignShelfApplication(_ application: ShelfApplication, store: ShelfStore, 
         try files.copyItem(at: TestFlightConfiguration.directory.appendingPathComponent("shelf-access.json"), to: access)
         try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: access.path)
     }
-    status("Re-signing \(current.name) \(current.version) (\(current.build)) from \(current.sourceCommit.prefix(7)) for \(devices.udids.count) iPhones…")
+    status("Rebuilding \(current.name) \(current.version) from \(current.sourceCommit.prefix(7)) for \(devices.udids.count) iPhones…")
     try deliverDirect(directory: checkout.path)
-    let (_, updated) = try store.catalog()
-    guard let resigned = updated.applications.first(where: { $0.bundleIdentifier == application.bundleIdentifier }), devices.isCurrent(resigned) else {
-        throw CommandError(message: "The re-signed build of \(current.name) was not published for every shelf iPhone.")
-    }
 }
 
 func publishShelfInvite(store: ShelfStore, devices: ShelfDevices) throws -> ShelfInvite {

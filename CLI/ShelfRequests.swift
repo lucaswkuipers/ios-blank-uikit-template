@@ -21,6 +21,12 @@ struct ShelfWorkerRequest: Decodable {
     let model: String
     let systemVersion: String
     let status: String
+    let invite: String?
+}
+
+struct ShelfWorkerInvite: Decodable {
+    let token: String
+    let request: String?
 }
 
 struct ShelfAccessRecord {
@@ -38,12 +44,12 @@ struct ShelfAccessRecord {
             (fields[key] as? [String: Any])?["value"] as? String
         }
         guard let name = record["recordName"] as? String, let changeTag = record["recordChangeTag"] as? String,
-              let udid = value("udid"), let deviceName = value("deviceName"), let status = value("status") else {
+              let deviceName = value("deviceName"), let status = value("status") else {
             throw CommandError(message: "CloudKit returned an incomplete access request: \(record["recordName"] ?? "unnamed").")
         }
         self.name = name
         self.changeTag = changeTag
-        self.udid = udid
+        udid = value("udid") ?? ""
         self.deviceName = deviceName
         self.status = status
         detail = value("detail") ?? ""
@@ -217,24 +223,78 @@ struct ShelfRequests {
         }
     }
 
+    func syncInvites(sign: (String) throws -> Data) throws {
+        let invitations = try records().filter { $0.status == "invited" }
+        let uploaded = try JSONDecoder().decode([ShelfWorkerInvite].self, from: workerRequest("/admin/invites", body: nil))
+        let expiry = (Date().timeIntervalSince1970 - 7 * 86400) * 1000
+        var active: Set<String> = []
+        for invitation in invitations {
+            isolate(invitation) {
+                let token = String(invitation.name.dropFirst("invite-".count))
+                guard invitation.name.hasPrefix("invite-"), token.range(of: "^[0-9a-f]{32}$", options: .regularExpression) != nil, invitation.created > expiry else {
+                    try delete(invitation.name)
+                    status("Removed the unused invite for \(invitation.deviceName).")
+                    return
+                }
+                active.insert(token)
+                guard !uploaded.contains(where: { $0.token == token }) else {
+                    return
+                }
+                let profile = try sign("\(configuration.url)/enroll?invite=\(token)")
+                _ = try workerRequest("/admin/invites", body: ["token": token, "name": shelfDisplayName(invitation.deviceName), "profile": profile.base64EncodedString()])
+                status("Prepared the invite for \(invitation.deviceName).")
+            }
+        }
+        for invite in uploaded where invite.request == nil && !active.contains(invite.token) {
+            guard try lookup("invite-\(invite.token)") == nil else {
+                continue
+            }
+            _ = try workerRequest("/admin/invites/remove", body: ["token": invite.token])
+        }
+    }
+
     func relay(devices: ShelfDevices) throws {
         let pending = try JSONDecoder().decode([ShelfWorkerRequest].self, from: workerRequest("/admin/requests", body: nil))
         guard !pending.isEmpty else {
             return
         }
-        let installable = Set(try records().filter { ["ready", "shared"].contains($0.status) }.map(\.udid))
+        let installable = Set(try records().filter { ["ready", "shared"].contains($0.status) }.map { $0.udid.lowercased() })
         for request in pending {
-            let deviceName = shelfDisplayName(request.deviceName)
+            var deviceName = shelfDisplayName(request.deviceName)
             do {
-                if devices.includes(request.udid) && installable.contains(request.udid) {
-                    if try lookup(request.id) == nil {
+                var invitation: ShelfAccessRecord?
+                if let invite = request.invite, let record = try lookup("invite-\(invite)"), record.status == "invited" {
+                    invitation = record
+                    deviceName = shelfDisplayName(record.deviceName)
+                }
+                let existing = try lookup(request.id)
+                if devices.includes(request.udid) && installable.contains(request.udid.lowercased()) {
+                    if existing == nil {
                         try create(name: request.id, udid: request.udid, deviceName: deviceName, model: shelfDisplayName(request.model), systemVersion: shelfDisplayName(request.systemVersion), status: "shared", detail: "")
+                    }
+                    if let invitation {
+                        try delete(invitation.name)
                     }
                     try updateWorker(request.id, status: "ready")
                     status("\(deviceName) already has access; its new request page shows the install link.")
                     continue
                 }
-                if try lookup(request.id) == nil {
+                if let invitation {
+                    if existing == nil {
+                        try create(name: request.id, udid: request.udid, deviceName: deviceName, model: shelfDisplayName(request.model), systemVersion: shelfDisplayName(request.systemVersion), status: "approved", detail: "")
+                    } else {
+                        try transition(request.id, from: ["waiting"], to: "approved", detail: "")
+                    }
+                    try delete(invitation.name)
+                    try updateWorker(request.id, status: "approved")
+                    status("\(deviceName) opened their invite; adding their iPhone.")
+                    continue
+                }
+                if existing?.status == "approved" {
+                    try updateWorker(request.id, status: "approved")
+                    continue
+                }
+                if existing == nil {
                     let detail = devices.includes(request.udid) ? "This iPhone already has access and asked again." : ""
                     try create(name: request.id, udid: request.udid, deviceName: deviceName, model: shelfDisplayName(request.model), systemVersion: shelfDisplayName(request.systemVersion), status: "waiting", detail: detail)
                 }
@@ -332,6 +392,11 @@ func processShelfRequests(store: ShelfStore) {
         let session = URLSession(configuration: .ephemeral, delegate: RejectRedirect(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
         if let requests = try ShelfRequests.load(session: session) {
+            do {
+                try requests.syncInvites { try shelfRequestProfile(enrollment: $0) }
+            } catch {
+                status("Invites wait until the request page answers again: \(error.localizedDescription)")
+            }
             do {
                 try requests.relay(devices: try ShelfDevices.load())
             } catch {
@@ -503,15 +568,15 @@ func wrangler(_ arguments: [String], directory: URL) throws -> String {
     return try run("/usr/bin/env", ["-C", directory.path, "npx", "--yes", "wrangler@4.143.0"] + arguments, log: nil, environment: environment, separateError: true)
 }
 
-func writeShelfRequestProfile(url: String, to destination: URL) throws {
+func shelfRequestProfile(enrollment: String) throws -> Data {
     let work = files.temporaryDirectory.appendingPathComponent("shelf-profile-\(UUID().uuidString)")
     try files.createDirectory(at: work, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     defer { try? files.removeItem(at: work) }
     let profile: [String: Any] = [
-        "PayloadContent": ["URL": "\(url)/enroll", "DeviceAttributes": ["UDID", "PRODUCT", "VERSION", "DEVICE_NAME"]],
+        "PayloadContent": ["URL": enrollment, "DeviceAttributes": ["UDID", "PRODUCT", "VERSION", "DEVICE_NAME"]],
         "PayloadOrganization": "Lucas Werner Kuipers",
         "PayloadDisplayName": "AppShelf access request",
-        "PayloadDescription": "Sends this iPhone's device ID to Lucas so he can approve it for AppShelf. Nothing stays installed.",
+        "PayloadDescription": "Shares this iPhone's device ID once so Lucas's apps can be installed on it. Nothing stays installed.",
         "PayloadIdentifier": "com.lucaswkuipers.AppShelf.request",
         "PayloadUUID": UUID().uuidString,
         "PayloadType": "Profile Service",
@@ -540,10 +605,12 @@ func writeShelfRequestProfile(url: String, to destination: URL) throws {
     guard let intermediate else {
         throw CommandError(message: "Cannot find Apple's intermediate certificate for the distribution identity in the keychain.")
     }
-    try run("/usr/bin/openssl", ["smime", "-sign", "-binary", "-nodetach", "-outform", "der", "-signer", certificate.path, "-inkey", signing.appendingPathComponent("distribution.key").path, "-certfile", intermediate.path, "-in", unsigned.path, "-out", destination.path], log: nil)
-    guard try run("/usr/bin/security", ["cms", "-D", "-i", destination.path], log: nil, separateError: true).contains("\(url)/enroll") else {
+    let signed = work.appendingPathComponent("signed.mobileconfig")
+    try run("/usr/bin/openssl", ["smime", "-sign", "-binary", "-nodetach", "-outform", "der", "-signer", certificate.path, "-inkey", signing.appendingPathComponent("distribution.key").path, "-certfile", intermediate.path, "-in", unsigned.path, "-out", signed.path], log: nil)
+    guard try run("/usr/bin/security", ["cms", "-D", "-i", signed.path], log: nil, separateError: true).contains("<string>\(enrollment)</string>") else {
         throw CommandError(message: "The signed access-request profile does not contain its enrollment URL.")
     }
+    return try Data(contentsOf: signed)
 }
 
 func setupShelfRequests(template: URL) throws {
@@ -653,7 +720,7 @@ func setupShelfRequests(template: URL) throws {
     guard let url else {
         throw CommandError(message: "Cannot determine the access-request address.")
     }
-    try writeShelfRequestProfile(url: url, to: profile)
+    try shelfRequestProfile(enrollment: "\(url)/enroll").write(to: profile)
     guard try deploy() == url else {
         throw CommandError(message: "Cloudflare moved the access-request worker away from \(url).")
     }

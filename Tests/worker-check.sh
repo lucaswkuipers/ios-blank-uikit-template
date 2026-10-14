@@ -66,7 +66,7 @@ EOF
 }
 
 enroll() {
-    curl -s -o /dev/null -w '%{redirect_url}' -X POST --data-binary @"$work/device-$1.p7s" "$base/enroll"
+    curl -s -o /dev/null -w '%{redirect_url}' -X POST --data-binary @"$work/device-$1.p7s" "$base/enroll${2:+?invite=$2}"
 }
 
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work/device.key" -out "$work/device.pem" -subj "/CN=Device" -days 1 2> /dev/null
@@ -119,4 +119,51 @@ open="$(curl -s "${admin[@]}" "$base/admin/requests" | grep -o '"status":"pendin
 check "the waiting cap holds under parallel requests" "$open" "20"
 check "extra requests are told to try later" "$(cat "$work"/result-* | grep -o 'error=busy' | wc -l | tr -d ' ')" "11"
 check "unknown requests" "$(curl -s -o /dev/null -w '%{http_code}' "$base/status/00000000-0000-0000-0000-000000000000")" "404"
-printf 'Passed worker page script, hidden buttons, profile, enrollment, approval for every request, admin auth, status transitions, pinned install links, device checks, and the atomic waiting cap.\n'
+
+invite="$(openssl rand -hex 16)"
+fixture="$(printf 'invite profile fixture' | base64)"
+offer() {
+    printf '{"token":"%s","name":"%s","profile":"%s"}' "$1" "$2" "$fixture"
+}
+sam="$(offer "$invite" Sam)"
+short="$(offer short Sam)"
+nameless="$(offer "$invite" "$(printf '\033')")"
+check "invites need the admin token" "$(curl -s -o /dev/null -w '%{http_code}' -d "$sam" "$base/admin/invites")" "401"
+check "malformed invites are rejected" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d "$short" "$base/admin/invites")" "400"
+check "nameless invites are rejected" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d "$nameless" "$base/admin/invites")" "400"
+check "invite upload" "$(curl -s "${admin[@]}" -d "$sam" "$base/admin/invites")" '{"updated":1}'
+check "uploading twice keeps one invite" "$(curl -s "${admin[@]}" -d "$sam" "$base/admin/invites")" '{"updated":0}'
+check "an unused invite greets its guest" "$(curl -s "$base/invite/$invite")" '{"status":"invited","install":null,"name":"Sam"}'
+check "the invite profile type" "$(curl -s -o "$work/invite.mobileconfig" -w '%{content_type}' "$base/invite/$invite.mobileconfig")" "application/x-apple-aspen-config"
+check "the invite profile is the uploaded one" "$(cat "$work/invite.mobileconfig")" "invite profile fixture"
+device iPhone16,1 00008130-000A1B2C3D4E5F70 sam
+check "an invite enrollment returns to the invite" "$(enroll sam "$invite")" "$base/?invite=$invite"
+check "invites skip the waiting cap" "$(curl -s "$base/invite/$invite")" '{"status":"pending","install":null,"name":"Sam"}'
+pending="$(curl -s "${admin[@]}" "$base/admin/requests")"
+check "the Mac sees which invite a request used" "$(printf '%s' "$pending" | grep -o "\"invite\":\"$invite\"" | head -1)" "\"invite\":\"$invite\""
+check "a used invite no longer hands out its profile" "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$base/invite/$invite.mobileconfig")" "302 $base/?invite=$invite"
+check "the same iPhone using its invite again returns to it" "$(enroll sam "$invite")" "$base/?invite=$invite"
+device iPhone16,1 00008130-000A1B2C3D4E5F71 other
+check "another iPhone with a used invite has to ask" "$(enroll other "$invite" | grep -o 'error=busy')" "error=busy"
+used="$(printf '%s' "$pending" | grep -o "{[^}]*\"invite\":\"$invite\"[^}]*}" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)"
+check "ready" "$(curl -s -o /dev/null -w '%{http_code}' "${admin[@]}" -d '{"status":"ready"}' "$base/admin/requests/$used")" "200"
+check "a ready invite shows the install link" "$(curl -s "$base/invite/$invite")" "{\"status\":\"ready\",\"install\":\"${prefix}abc/AppShelf.plist\",\"name\":\"Sam\"}"
+removal="$(printf '{"token":"%s"}' "$invite")"
+check "used invites are kept" "$(curl -s "${admin[@]}" -d "$removal" "$base/admin/invites/remove")" '{"updated":0}'
+cancelled="$(openssl rand -hex 16)"
+kim="$(offer "$cancelled" Kim)"
+curl -s -o /dev/null "${admin[@]}" -d "$kim" "$base/admin/invites"
+removal="$(printf '{"token":"%s"}' "$cancelled")"
+check "unused invites can be cancelled" "$(curl -s "${admin[@]}" -d "$removal" "$base/admin/invites/remove")" '{"updated":1}'
+check "a cancelled invite is unknown" "$(curl -s -o /dev/null -w '%{http_code}' "$base/invite/$cancelled")" "404"
+check "a cancelled invite profile returns to the page" "$(curl -s -o /dev/null -w '%{http_code}' "$base/invite/$cancelled.mobileconfig")" "302"
+listed="$(printf '[{"token":"%s","request":"%s"}]' "$invite" "$used")"
+check "the Mac lists invites" "$(curl -s "${admin[@]}" "$base/admin/invites")" "$listed"
+waiting="$(openssl rand -hex 16)"
+again="$(offer "$waiting" Alex)"
+curl -s -o /dev/null "${admin[@]}" -d "$again" "$base/admin/invites"
+alex="$(curl -s "${admin[@]}" "$base/admin/requests" | grep -o '{"id":"[^"]*","udid":"00008140-000A1B2C3D4E5F60"' | cut -d'"' -f4)"
+curl -s -o /dev/null "${admin[@]}" -d '{"status":"waiting"}' "$base/admin/requests/$alex"
+check "an invite takes over an open request" "$(enroll alex "$waiting")" "$base/?invite=$waiting"
+check "the taken-over request goes back to the Mac" "$(curl -s "$base/status/$alex")" '{"status":"pending","install":null}'
+printf 'Passed worker page script, hidden buttons, profile, enrollment, approval for every request, admin auth, status transitions, pinned install links, device checks, the atomic waiting cap, and single-use invites.\n'

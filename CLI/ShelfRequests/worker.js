@@ -1,6 +1,7 @@
 import profile from "./request.mobileconfig"
 
 const statuses = ["pending", "waiting", "approved", "preparing", "ready", "failed", "declined", "removed"]
+const inviteToken = /^[0-9a-f]{32}$/
 const baseHeaders = { "cache-control": "no-store", "x-content-type-options": "nosniff" }
 
 function json(value, status) {
@@ -41,6 +42,27 @@ async function body(request) {
   }
 }
 
+async function claim(env, invite, device, now) {
+  const row = await env.DB.prepare("SELECT request FROM invites WHERE token = ?").bind(invite).first()
+  if (!row) {
+    return false
+  }
+  if (row.request) {
+    const used = await env.DB.prepare("SELECT udid FROM requests WHERE id = ?").bind(row.request).first()
+    return used !== null && used.udid.toLowerCase() === device.udid.toLowerCase()
+  }
+  const open = await env.DB.prepare("SELECT id FROM requests WHERE udid = ? AND status IN ('pending', 'waiting')").bind(device.udid).first()
+  const id = open ? open.id : crypto.randomUUID()
+  await env.DB.batch([
+    env.DB.prepare("INSERT OR IGNORE INTO requests (id, udid, device_name, model, system_version, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)")
+      .bind(id, device.udid, device.name, device.model, device.systemVersion, now, now),
+    env.DB.prepare("UPDATE requests SET status = 'pending', updated_at = ? WHERE id = ? AND status = 'waiting'").bind(now, id),
+    env.DB.prepare("UPDATE invites SET request = ? WHERE token = ? AND request IS NULL AND EXISTS (SELECT 1 FROM requests WHERE id = ?)").bind(id, invite, id)
+  ])
+  const claimed = await env.DB.prepare("SELECT request FROM invites WHERE token = ?").bind(invite).first()
+  return claimed !== null && claimed.request === id
+}
+
 async function enroll(request, env) {
   const text = new TextDecoder().decode(await request.arrayBuffer())
   const start = text.indexOf("<?xml")
@@ -54,13 +76,16 @@ async function enroll(request, env) {
   if (!/^(iPhone|iPad|iPod)/.test(model)) {
     return back(request, "error=iphone")
   }
-  const deviceName = clean(attribute(plist, "DEVICE_NAME"), 50) || "iPhone"
-  const systemVersion = clean(attribute(plist, "VERSION"), 20)
+  const device = { udid, model, name: clean(attribute(plist, "DEVICE_NAME"), 50) || "iPhone", systemVersion: clean(attribute(plist, "VERSION"), 20) }
   const now = new Date().toISOString()
+  const invite = new URL(request.url).searchParams.get("invite") ?? ""
+  if (inviteToken.test(invite) && await claim(env, invite, device, now)) {
+    return back(request, `invite=${invite}`)
+  }
   const recent = new Date(Date.now() - 7 * 86400000).toISOString()
   await env.DB.prepare(`INSERT OR IGNORE INTO requests (id, udid, device_name, model, system_version, status, created_at, updated_at)
     SELECT ?, ?, ?, ?, ?, 'pending', ?, ? WHERE (SELECT COUNT(*) FROM requests WHERE status IN ('pending', 'waiting') AND created_at > ?) < 20`)
-    .bind(crypto.randomUUID(), udid, deviceName, model, systemVersion, now, now, recent).run()
+    .bind(crypto.randomUUID(), udid, device.name, model, device.systemVersion, now, now, recent).run()
   const open = await env.DB.prepare("SELECT id FROM requests WHERE udid = ? AND status IN ('pending', 'waiting')").bind(udid).first()
   if (!open) {
     return back(request, "error=busy")
@@ -68,16 +93,39 @@ async function enroll(request, env) {
   return back(request, `request=${open.id}`)
 }
 
-async function requestStatus(id, env) {
+async function state(id, env) {
   const row = await env.DB.prepare("SELECT status FROM requests WHERE id = ?").bind(id).first()
+  if (!row) {
+    return null
+  }
+  if (row.status !== "ready") {
+    return { status: row.status, install: null }
+  }
+  const setting = await env.DB.prepare("SELECT value FROM settings WHERE key = 'install'").first()
+  return { status: row.status, install: setting ? setting.value : env.INSTALL_LINK }
+}
+
+async function requestStatus(id, env) {
+  const current = await state(id, env)
+  return current ? json(current, 200) : json({ status: "unknown" }, 404)
+}
+
+async function inviteStatus(invite, env) {
+  const row = await env.DB.prepare("SELECT name, request FROM invites WHERE token = ?").bind(invite).first()
   if (!row) {
     return json({ status: "unknown" }, 404)
   }
-  if (row.status !== "ready") {
-    return json({ status: row.status, install: null }, 200)
+  const current = row.request ? await state(row.request, env) : null
+  return json({ status: "invited", install: null, ...current, name: row.name }, 200)
+}
+
+async function inviteProfile(invite, request, env) {
+  const row = await env.DB.prepare("SELECT profile FROM invites WHERE token = ? AND request IS NULL").bind(invite).first()
+  if (!row) {
+    return Response.redirect(`${new URL(request.url).origin}/?invite=${invite}`, 302)
   }
-  const setting = await env.DB.prepare("SELECT value FROM settings WHERE key = 'install'").first()
-  return json({ status: row.status, install: setting ? setting.value : env.INSTALL_LINK }, 200)
+  const bytes = Uint8Array.from(atob(row.profile), character => character.charCodeAt(0))
+  return new Response(bytes, { headers: { ...baseHeaders, "content-type": "application/x-apple-aspen-config" } })
 }
 
 async function administer(request, env, path) {
@@ -85,7 +133,8 @@ async function administer(request, env, path) {
     return json({ error: "unauthorized" }, 401)
   }
   if (request.method === "GET" && path === "/admin/requests") {
-    const { results } = await env.DB.prepare("SELECT id, udid, device_name AS deviceName, model, system_version AS systemVersion, status FROM requests WHERE status = 'pending' ORDER BY created_at").all()
+    const { results } = await env.DB.prepare(`SELECT requests.id, requests.udid, requests.device_name AS deviceName, requests.model, requests.system_version AS systemVersion, requests.status, invites.token AS invite
+      FROM requests LEFT JOIN invites ON invites.request = requests.id WHERE requests.status = 'pending' ORDER BY requests.created_at`).all()
     return json(results, 200)
   }
   const match = path.match(/^\/admin\/requests\/([0-9a-f-]{36})$/)
@@ -104,6 +153,27 @@ async function administer(request, env, path) {
     }
     await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('install', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bind(link).run()
     return json({ updated: 1 }, 200)
+  }
+  if (request.method === "GET" && path === "/admin/invites") {
+    const { results } = await env.DB.prepare("SELECT token, request FROM invites ORDER BY created_at").all()
+    return json(results, 200)
+  }
+  if (request.method === "POST" && path === "/admin/invites") {
+    const { token, name, profile: encoded } = await body(request)
+    const display = typeof name === "string" ? clean(name, 50) : ""
+    if (typeof token !== "string" || !inviteToken.test(token) || !display || typeof encoded !== "string" || encoded.length > 65536 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+      return json({ error: "invalid invite" }, 400)
+    }
+    const result = await env.DB.prepare("INSERT OR IGNORE INTO invites (token, name, profile, request, created_at) VALUES (?, ?, ?, NULL, ?)").bind(token, display, encoded, new Date().toISOString()).run()
+    return json({ updated: result.meta.changes }, 200)
+  }
+  if (request.method === "POST" && path === "/admin/invites/remove") {
+    const { token } = await body(request)
+    if (typeof token !== "string" || !inviteToken.test(token)) {
+      return json({ error: "invalid invite" }, 400)
+    }
+    const result = await env.DB.prepare("DELETE FROM invites WHERE token = ? AND request IS NULL").bind(token).run()
+    return json({ updated: result.meta.changes }, 200)
   }
   return json({ error: "not found" }, 404)
 }
@@ -126,6 +196,8 @@ function page(env) {
   main { box-sizing: border-box; width: calc(100% - 32px); max-width: 420px; margin: 24px 16px; padding: 32px 24px; border-radius: 24px; background: var(--card); text-align: center; }
   h1 { margin: 0 0 12px; font-size: 28px; }
   p { margin: 0; }
+  ol { margin: 20px 0 0; padding-left: 24px; text-align: left; }
+  li { margin-top: 8px; }
   a { display: block; margin-top: 24px; padding: 16px; border-radius: 14px; background: var(--accent); color: #ffffff; font-weight: 600; text-decoration: none; }
   small { display: block; margin-top: 16px; color: var(--secondary); font-size: 15px; }
 </style>
@@ -134,6 +206,7 @@ function page(env) {
 <main>
   <h1>AppShelf</h1>
   <p id="message"></p>
+  <ol id="steps" hidden></ol>
   <a id="action" hidden></a>
   <small id="note"></small>
 </main>
@@ -142,10 +215,14 @@ function page(env) {
   const minimum = ${minimum}
   const requirement = minimum ? " AppShelf needs iOS " + minimum + " or later." : ""
   const message = document.getElementById("message")
+  const steps = document.getElementById("steps")
   const action = document.getElementById("action")
   const note = document.getElementById("note")
   const parameters = new URLSearchParams(location.search)
   const failure = parameters.get("error")
+  const invite = /^[0-9a-f]{32}$/.test(parameters.get("invite") ?? "") ? parameters.get("invite") : null
+  const opened = Date.now()
+  let shown = ""
   let request = parameters.get("request")
   try {
     if (request) {
@@ -161,7 +238,12 @@ function page(env) {
   const onDevice = /iPhone|iPad|iPod/.test(agent) || (/Macintosh/.test(agent) && navigator.maxTouchPoints > 1)
   const inSafari = onDevice && !/CriOS|FxiOS|EdgiOS|OPiOS|GSA|FBAN|FBAV|Instagram/.test(agent)
 
-  function show(text, details, link, label) {
+  function show(text, details, link, label, instructions) {
+    const next = JSON.stringify([text, details, link, label, instructions])
+    if (next === shown) {
+      return
+    }
+    shown = next
     message.textContent = text
     note.textContent = details
     action.hidden = !link
@@ -169,15 +251,25 @@ function page(env) {
       action.href = link
       action.textContent = label
     }
+    steps.hidden = !instructions
+    steps.replaceChildren(...(instructions ?? []).map(instruction => {
+      const item = document.createElement("li")
+      item.textContent = instruction
+      return item
+    }))
   }
 
-  function offerRequest(text, label) {
+  function offer(text, label, link) {
     if (!onDevice) {
       show("Open this link on your iPhone.", "AppShelf installs " + owner + "'s apps on the iPhone that opens this page.")
     } else if (!inSafari) {
-      show("Open this link in Safari.", "Copy the link and paste it into Safari. Other browsers cannot request access or install apps.")
+      show("Open this link in Safari.", "Copy the link and paste it into Safari. Other browsers cannot set up AppShelf.")
     } else {
-      show(text, "Tap " + label + ", then Allow. Open Settings, tap Profile Downloaded, and install it. It only shares this iPhone's device ID with " + owner + " and removes itself right away." + requirement, "/request.mobileconfig", label)
+      show(text, "The profile only shares this iPhone's device ID, and it removes itself right away." + requirement, link, label, [
+        "Tap " + label + " below, then tap Allow.",
+        "Open Settings, tap Profile Downloaded near the top, then tap Install and enter your passcode.",
+        "Safari opens this page again and finishes by itself."
+      ])
     }
   }
 
@@ -188,26 +280,79 @@ function page(env) {
     request = null
   }
 
-  async function refresh() {
+  async function fetchState(path) {
+    try {
+      const response = await fetch(path, { cache: "no-store" })
+      return await response.json()
+    } catch {
+      show("Can't reach AppShelf right now.", "This page tries again automatically.")
+      setTimeout(refresh, 15000)
+      return null
+    }
+  }
+
+  function showReady(greeting, link) {
+    show(greeting + "This iPhone is ready.", "Tap Install AppShelf, then Install. Open AppShelf from your Home Screen, allow notifications, and install the apps you want. A few apps can take a little longer." + requirement, link, "Install AppShelf")
+  }
+
+  async function refreshInvite() {
+    const state = await fetchState("/invite/" + invite)
+    if (!state) {
+      return
+    }
+    const greeting = state.name ? "Hi " + state.name + "! " : ""
+    switch (state.status) {
+    case "invited":
+      offer(greeting + "You're invited to get " + owner + "'s apps on this iPhone.", "Get Started", "/invite/" + invite + ".mobileconfig")
+      setTimeout(refresh, 10000)
+      return
+    case "pending":
+    case "approved":
+    case "preparing":
+      show(greeting + "Setting up AppShelf for this iPhone…", "This usually takes a minute or two. Keep this page open; it updates by itself.")
+      setTimeout(refresh, 5000)
+      return
+    case "waiting":
+      show(greeting + "Waiting for " + owner + " to confirm this iPhone.", "This page updates by itself once it's confirmed.")
+      setTimeout(refresh, 10000)
+      return
+    case "failed":
+      show(greeting + "Setup did not finish yet.", owner + " can see the problem and will try again. This page updates by itself.")
+      setTimeout(refresh, 30000)
+      return
+    case "ready":
+      showReady(greeting, state.install)
+      return
+    case "declined":
+    case "removed":
+      show("This invite is no longer active.", "Ask " + owner + " if you still need access.")
+      return
+    default:
+      if (Date.now() - opened < 180000) {
+        show("Getting your invite ready…", "This takes up to a minute.")
+        setTimeout(refresh, 5000)
+      } else {
+        show("This invite link doesn't work anymore.", "Ask " + owner + " to send you a new one.")
+      }
+      return
+    }
+  }
+
+  async function refreshRequest() {
     if (failure === "busy") {
       show("Too many requests are waiting.", owner + " has too many open requests right now. Try again later.")
       return
     }
     if (failure) {
-      offerRequest("This page only works on an iPhone or iPad.", "Request access")
+      offer("This page only works on an iPhone or iPad.", "Request Access", "/request.mobileconfig")
       return
     }
     if (!request) {
-      offerRequest("Get " + owner + "'s apps on this iPhone.", "Request access")
+      offer("Get " + owner + "'s apps on this iPhone.", "Request Access", "/request.mobileconfig")
       return
     }
-    let state
-    try {
-      const response = await fetch("/status/" + request, { cache: "no-store" })
-      state = await response.json()
-    } catch {
-      show("Can't reach AppShelf right now.", "This page tries again automatically.")
-      setTimeout(refresh, 15000)
+    const state = await fetchState("/status/" + request)
+    if (!state) {
       return
     }
     switch (state.status) {
@@ -217,31 +362,32 @@ function page(env) {
       break
     case "approved":
     case "preparing":
-      show(owner + " approved this iPhone.", "Preparing AppShelf for this iPhone. This takes a few minutes.")
+      show(owner + " approved this iPhone.", "Setting up AppShelf for this iPhone. This usually takes a minute or two.")
       break
     case "failed":
       show(owner + " approved this iPhone, but setup did not finish yet.", owner + " can see the problem and will try again. This page updates when it's ready.")
       setTimeout(refresh, 30000)
       return
     case "ready":
-      show("This iPhone is approved.", "Install AppShelf, open it, allow notifications, and install apps. Some apps can take a few more minutes before they install." + requirement, state.install, "Install AppShelf")
+      showReady("", state.install)
       return
     case "declined":
       forget()
-      offerRequest(owner + " declined this request.", "Request again")
+      offer(owner + " declined this request.", "Request Again", "/request.mobileconfig")
       return
     case "removed":
       forget()
-      offerRequest(owner + " removed this iPhone from AppShelf.", "Request again")
+      offer(owner + " removed this iPhone from AppShelf.", "Request Again", "/request.mobileconfig")
       return
     default:
       forget()
-      offerRequest("Get " + owner + "'s apps on this iPhone.", "Request access")
+      offer("Get " + owner + "'s apps on this iPhone.", "Request Access", "/request.mobileconfig")
       return
     }
     setTimeout(refresh, 10000)
   }
 
+  const refresh = invite ? refreshInvite : refreshRequest
   refresh()
 </script>
 </body>
@@ -270,6 +416,10 @@ export default {
     const status = url.pathname.match(/^\/status\/([0-9a-f-]{36})$/)
     if (request.method === "GET" && status) {
       return requestStatus(status[1], env)
+    }
+    const invitation = url.pathname.match(/^\/invite\/([0-9a-f]{32})(\.mobileconfig)?$/)
+    if (request.method === "GET" && invitation) {
+      return invitation[2] ? inviteProfile(invitation[1], request, env) : inviteStatus(invitation[1], env)
     }
     if (request.method === "GET" && url.pathname === "/") {
       return page(env)

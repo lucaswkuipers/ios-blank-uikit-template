@@ -283,53 +283,10 @@ func deliverDirect(directory: String) throws {
     }
     let build = try ShelfDeliveryState.reserve(bundle: metadata.bundleIdentifier, commit: commit, minimum: minimum, directory: TestFlightConfiguration.directory).build
     let package = try packageDirect(directory: directory, build: build)
-    let tag = "\(metadata.name)-\(build)-\(commit.prefix(12))"
-    let releasesOutput = try store.github.call(["api", "--paginate", "--slurp", "repos/\(ShelfStore.repository)/releases?per_page=100"])
-    let releases = try store.decoder.decode([[ShelfRelease]].self, from: Data(releasesOutput.utf8)).flatMap { $0 }
-    var artifactRelease: ShelfRelease
-    if let existing = releases.first(where: { release in
-        if release.tag_name == tag { return true }
-        guard release.draft, let body = release.body,
-              let intent = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any] else { return false }
-        return intent["sourceCommit"] as? String == commit && intent["bundleIdentifier"] as? String == metadata.bundleIdentifier && intent["build"] as? String == build
-    }) {
-        artifactRelease = existing
-    } else {
-        let request = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? files.removeItem(at: request) }
-        let intent = String(decoding: try JSONSerialization.data(withJSONObject: ["sourceCommit": commit, "bundleIdentifier": metadata.bundleIdentifier, "build": build]), as: UTF8.self)
-        try JSONSerialization.data(withJSONObject: ["tag_name": tag, "name": "\(metadata.name) \(package.version) (\(build))", "body": intent, "draft": true]).write(to: request, options: .atomic)
-        let output = try store.github.call(["api", "--method", "POST", "repos/\(ShelfStore.repository)/releases", "--input", request.path])
-        artifactRelease = try store.decoder.decode(ShelfRelease.self, from: Data(output.utf8))
-    }
-    let application: ShelfApplication
-    if !artifactRelease.draft {
-        guard let body = artifactRelease.body else { throw CommandError(message: "Published release has no metadata.") }
-        let existing = try store.decoder.decode(ShelfApplication.self, from: Data(body.utf8))
-        guard existing.sourceCommit == commit, existing.bundleIdentifier == metadata.bundleIdentifier, existing.build == build else {
-            throw CommandError(message: "Published release differs from this package. Immutable assets were preserved.")
-        }
-        application = existing
-    } else {
-        for asset in artifactRelease.assets {
-            try store.github.call(["api", "--method", "DELETE", "repos/\(ShelfStore.repository)/releases/assets/\(asset.id)"])
-        }
-        let asset = try store.upload(URL(fileURLWithPath: package.path), name: "\(metadata.name).ipa", contentType: "application/octet-stream", releaseID: artifactRelease.id)
-        guard asset.size == package.size, asset.digest == "sha256:\(package.sha256)" else {
-            throw CommandError(message: "GitHub's uploaded package size or checksum differs. The release remains a draft.")
-        }
-        let previousApplication = previous.applications.first(where: { $0.bundleIdentifier == metadata.bundleIdentifier })
-        let resignedForDevices = previousApplication.map { $0.sourceCommit == commit && !devices.isCurrent($0) } ?? false
-        application = ShelfApplication(name: package.name, bundleIdentifier: package.bundleIdentifier, version: package.version, build: package.build, minimumOSVersion: package.minimumOSVersion, profileExpiration: package.profileExpiration, sourceCommit: commit, sha256: package.sha256, size: package.size, packageAssetID: asset.id, publishedAt: Date(), manifestAssetID: nil, installExpiration: nil, iconPNG: try shelfIcon(root: root, name: metadata.name), notificationTitle: previousApplication == nil ? "New app available" : "Update available", deviceSet: package.devices, silent: resignedForDevices)
-        try store.updateBody(application, releaseID: artifactRelease.id)
-        let request = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? files.removeItem(at: request) }
-        try JSONSerialization.data(withJSONObject: ["tag_name": tag, "draft": false, "make_latest": "false"]).write(to: request, options: .atomic)
-        let output = try store.github.call(["api", "--method", "PATCH", "repos/\(ShelfStore.repository)/releases/\(artifactRelease.id)", "--input", request.path])
-        let published = try store.decoder.decode(ShelfRelease.self, from: Data(output.utf8))
-        guard !published.draft, published.tag_name == tag, published.assets.contains(where: { $0.id == asset.id }) else {
-            throw CommandError(message: "GitHub did not confirm the complete published release. Retry to reconcile this build.")
-        }
+    let previousApplication = previous.applications.first(where: { $0.bundleIdentifier == metadata.bundleIdentifier })
+    let resignedForDevices = previousApplication.map { $0.sourceCommit == commit && !devices.isCurrent($0) } ?? false
+    let application = try publishShelfArtifact(store: store, tag: "\(metadata.name)-\(build)-\(commit.prefix(12))", title: "\(metadata.name) \(package.version) (\(build))", intent: ["sourceCommit": commit, "bundleIdentifier": metadata.bundleIdentifier, "build": build], package: URL(fileURLWithPath: package.path), assetName: "\(metadata.name).ipa", size: package.size, sha256: package.sha256) { asset in
+        ShelfApplication(name: package.name, bundleIdentifier: package.bundleIdentifier, version: package.version, build: package.build, minimumOSVersion: package.minimumOSVersion, profileExpiration: package.profileExpiration, sourceCommit: commit, sha256: package.sha256, size: package.size, packageAssetID: asset.id, publishedAt: Date(), manifestAssetID: nil, installExpiration: nil, iconPNG: try shelfIcon(root: root, name: metadata.name), notificationTitle: previousApplication == nil ? "New app available" : "Update available", deviceSet: package.devices, silent: resignedForDevices)
     }
     try withShelfLock {
         let (release, latest) = try store.catalog()
@@ -349,6 +306,55 @@ func deliverDirect(directory: String) throws {
         _ = try store.refresh()
     }
     try emit(["result": "available-in-shelf", "app": metadata.name, "build": build, "team": TestFlightConfiguration.personalTeam, "sourcesChanged": String(try sourceFingerprint(root) != package.fingerprint)])
+}
+
+func publishShelfArtifact(store: ShelfStore, tag: String, title: String, intent: [String: String], package: URL, assetName: String, size: Int, sha256: String, describe: (ShelfAsset) throws -> ShelfApplication) throws -> ShelfApplication {
+    let output = try store.github.call(["api", "--paginate", "--slurp", "repos/\(ShelfStore.repository)/releases?per_page=100"])
+    let releases = try store.decoder.decode([[ShelfRelease]].self, from: Data(output.utf8)).flatMap { $0 }
+    let drafted = releases.first { release in
+        guard release.draft, let body = release.body,
+              let saved = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: String] else {
+            return false
+        }
+        return saved == intent
+    }
+    let artifactRelease: ShelfRelease
+    if let existing = releases.first(where: { $0.tag_name == tag }) ?? drafted {
+        artifactRelease = existing
+    } else {
+        let request = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? files.removeItem(at: request) }
+        let body = String(decoding: try JSONSerialization.data(withJSONObject: intent, options: [.sortedKeys]), as: UTF8.self)
+        try JSONSerialization.data(withJSONObject: ["tag_name": tag, "name": title, "body": body, "draft": true]).write(to: request, options: .atomic)
+        artifactRelease = try store.decoder.decode(ShelfRelease.self, from: Data(store.github.call(["api", "--method", "POST", "repos/\(ShelfStore.repository)/releases", "--input", request.path]).utf8))
+    }
+    if !artifactRelease.draft {
+        guard let body = artifactRelease.body else {
+            throw CommandError(message: "Published release has no metadata.")
+        }
+        let existing = try store.decoder.decode(ShelfApplication.self, from: Data(body.utf8))
+        guard existing.sourceCommit == intent["sourceCommit"], existing.bundleIdentifier == intent["bundleIdentifier"], existing.build == intent["build"] else {
+            throw CommandError(message: "Published release differs from this package. Immutable assets were preserved.")
+        }
+        return existing
+    }
+    for asset in artifactRelease.assets {
+        try store.github.call(["api", "--method", "DELETE", "repos/\(ShelfStore.repository)/releases/assets/\(asset.id)"])
+    }
+    let asset = try store.upload(package, name: assetName, contentType: "application/octet-stream", releaseID: artifactRelease.id)
+    guard asset.size == size, asset.digest == "sha256:\(sha256)" else {
+        throw CommandError(message: "GitHub's uploaded package size or checksum differs. The release remains a draft.")
+    }
+    let application = try describe(asset)
+    try store.updateBody(application, releaseID: artifactRelease.id)
+    let request = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? files.removeItem(at: request) }
+    try JSONSerialization.data(withJSONObject: ["tag_name": tag, "draft": false, "make_latest": "false"]).write(to: request, options: .atomic)
+    let published = try store.decoder.decode(ShelfRelease.self, from: Data(store.github.call(["api", "--method", "PATCH", "repos/\(ShelfStore.repository)/releases/\(artifactRelease.id)", "--input", request.path]).utf8))
+    guard !published.draft, published.tag_name == tag, published.assets.contains(where: { $0.id == asset.id }) else {
+        throw CommandError(message: "GitHub did not confirm the complete published release. Retry to reconcile this build.")
+    }
+    return application
 }
 
 func shelfIcon(root: URL, name: String) throws -> String? {

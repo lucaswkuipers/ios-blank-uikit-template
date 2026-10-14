@@ -3,6 +3,7 @@ import Foundation
 
 final class MockShelfProtocol: URLProtocol {
     static var workerRows: [[String: Any]] = []
+    static var workerInvites: [[String: Any]] = []
     static var cloudRecords: [[String: Any]] = []
     static var workerUpdates: [String] = []
     static var cloudOperations: [[String: Any]] = []
@@ -29,8 +30,10 @@ final class MockShelfProtocol: URLProtocol {
         let response: Any
         if path == "/admin/requests" {
             response = Self.workerRows
+        } else if path == "/admin/invites" && request.httpMethod == "GET" {
+            response = Self.workerInvites
         } else if path.hasPrefix("/admin/") {
-            Self.workerUpdates.append("\(path.split(separator: "/").last!)=\(json["status"] ?? json["link"] ?? "")")
+            Self.workerUpdates.append("\(path.split(separator: "/").last!)=\(json["status"] ?? json["link"] ?? json["token"] ?? "")")
             response = ["updated": 1]
         } else if path.hasSuffix("/records/query") {
             response = ["records": Self.cloudRecords]
@@ -80,6 +83,7 @@ func testShelfRequests(directory: URL) throws {
 
     func reset(rows: [[String: Any]], records: [[String: Any]]) {
         MockShelfProtocol.workerRows = rows
+        MockShelfProtocol.workerInvites = []
         MockShelfProtocol.cloudRecords = records
         MockShelfProtocol.workerUpdates = []
         MockShelfProtocol.cloudOperations = []
@@ -113,6 +117,53 @@ func testShelfRequests(directory: URL) throws {
     reset(rows: [row(new, udid: "FRIEND-IPHONE", status: "pending")], records: [record(own, udid: "FRIEND-IPHONE", status: "shared")])
     try requests.relay(devices: shared)
     try expect(operations() == ["create-\(new)=shared"] && MockShelfProtocol.workerUpdates == ["\(new)=ready"], "A shared iPhone asking again gets the install link without another approval")
+
+    let token = "0123456789abcdef0123456789abcdef"
+    func invitation(_ token: String, name: String, created: Date) -> [String: Any] {
+        ["recordName": "invite-\(token)", "recordChangeTag": "tag", "recordType": "ShelfAccessRequest", "created": ["timestamp": created.timeIntervalSince1970 * 1000], "fields": ["deviceName": ["value": name], "status": ["value": "invited"]]]
+    }
+    func invited(_ id: String, udid: String) -> [String: Any] {
+        var request = row(id, udid: udid, status: "pending")
+        request["invite"] = token
+        return request
+    }
+
+    reset(rows: [invited(new, udid: "stranger-iphone")], records: [invitation(token, name: "Sam", created: Date())])
+    try requests.relay(devices: shared)
+    try expect(operations() == ["create-\(new)=approved", "forceDelete-invite-\(token)"] && field("deviceName", of: 0) == "Sam", "An invite approves its iPhone under the invited name and is used up")
+    try expect(MockShelfProtocol.workerUpdates == ["\(new)=approved"], "The invited visitor sees setup start without waiting for the owner")
+
+    reset(rows: [invited(new, udid: "stranger-iphone")], records: [record(new, udid: "stranger-iphone", status: "approved")])
+    try requests.relay(devices: shared)
+    try expect(operations().isEmpty && MockShelfProtocol.workerUpdates == ["\(new)=approved"], "A relay interrupted after using the invite finishes without asking the owner")
+
+    reset(rows: [invited(new, udid: "stranger-iphone")], records: [record(new, udid: "stranger-iphone", status: "waiting"), invitation(token, name: "Sam", created: Date())])
+    try requests.relay(devices: shared)
+    try expect(operations() == ["update-\(new)=approved", "forceDelete-invite-\(token)"], "An invite approves a request that was already waiting")
+
+    reset(rows: [invited(new, udid: "FRIEND-IPHONE")], records: [record(own, udid: "friend-iphone", status: "shared"), invitation(token, name: "Sam", created: Date())])
+    try requests.relay(devices: shared)
+    try expect(operations() == ["create-\(new)=shared", "forceDelete-invite-\(token)"] && MockShelfProtocol.workerUpdates == ["\(new)=ready"], "An invite used by an iPhone that already has access goes straight to the install link")
+
+    let expired = "fedcba9876543210fedcba9876543210"
+    var signed: [String] = []
+    reset(rows: [], records: [invitation(token, name: "Sam", created: Date()), invitation(expired, name: "Kim", created: Date().addingTimeInterval(-8 * 86400))])
+    try requests.syncInvites { enrollment in
+        signed.append(enrollment)
+        return Data("profile".utf8)
+    }
+    try expect(signed == ["https://worker.invalid/enroll?invite=\(token)"] && MockShelfProtocol.workerUpdates == ["invites=\(token)"], "New invites get their own signed profile on the request page")
+    try expect(operations() == ["forceDelete-invite-\(expired)"], "Invites expire unused after seven days")
+
+    let cancelled = "00000000000000000000000000000000"
+    reset(rows: [], records: [invitation(token, name: "Sam", created: Date())])
+    MockShelfProtocol.workerInvites = [["token": token], ["token": cancelled], ["token": expired, "request": new]]
+    signed = []
+    try requests.syncInvites { enrollment in
+        signed.append(enrollment)
+        return Data("profile".utf8)
+    }
+    try expect(signed.isEmpty && MockShelfProtocol.workerUpdates == ["remove=\(cancelled)"], "Cancelled invites leave the request page, while used ones stay so their link keeps working")
 
     let friendRequest = identifier("33333333")
     let strangerRequest = identifier("44444444")
