@@ -219,9 +219,18 @@ struct ShelfRequests {
 
     func relay(devices: ShelfDevices) throws {
         let pending = try JSONDecoder().decode([ShelfWorkerRequest].self, from: workerRequest("/admin/requests", body: nil))
+        guard !pending.isEmpty else {
+            return
+        }
+        let installable = Set(try records().filter { ["ready", "shared"].contains($0.status) }.map(\.udid))
         for request in pending {
             let deviceName = shelfDisplayName(request.deviceName)
             do {
+                if devices.includes(request.udid) && installable.contains(request.udid) {
+                    try updateWorker(request.id, status: "ready")
+                    status("\(deviceName) already has access; its new request page shows the install link.")
+                    continue
+                }
                 if try lookup(request.id) == nil {
                     let detail = devices.includes(request.udid) ? "This iPhone already has access and asked again." : ""
                     try create(name: request.id, udid: request.udid, deviceName: deviceName, model: shelfDisplayName(request.model), systemVersion: shelfDisplayName(request.systemVersion), status: "waiting", detail: detail)

@@ -101,7 +101,7 @@ func testShelfRequests(directory: URL) throws {
 
     reset(rows: [row(new, udid: "stranger-iphone", status: "pending"), row(own, udid: "OWNER-IPHONE", status: "pending")], records: [])
     try requests.relay(devices: shared)
-    try expect(operations() == ["create-\(new)=waiting", "create-\(own)=waiting"], "Every request, even from an approved iPhone, needs the owner's approval")
+    try expect(operations() == ["create-\(new)=waiting", "create-\(own)=waiting"], "Requests from iPhones without an installable shared record need the owner's approval")
     try expect(field("deviceName", of: 0) == "Phone [2J", "Device names lose control and direction-override characters")
     try expect(field("detail", of: 1) == "This iPhone already has access and asked again." && field("detail", of: 0) == "", "Repeat requests from approved iPhones are labeled")
     try expect(MockShelfProtocol.workerUpdates == ["\(new)=waiting", "\(own)=waiting"], "Visitors learn the owner was notified")
@@ -109,6 +109,10 @@ func testShelfRequests(directory: URL) throws {
     reset(rows: [row(new, udid: "stranger-iphone", status: "pending")], records: [record(new, udid: "stranger-iphone", status: "waiting")])
     try requests.relay(devices: shared)
     try expect(operations().isEmpty && MockShelfProtocol.workerUpdates == ["\(new)=waiting"], "A relayed request is not created twice")
+
+    reset(rows: [row(new, udid: "FRIEND-IPHONE", status: "pending")], records: [record(own, udid: "FRIEND-IPHONE", status: "shared")])
+    try requests.relay(devices: shared)
+    try expect(operations().isEmpty && MockShelfProtocol.workerUpdates == ["\(new)=ready"], "A shared iPhone asking again gets the install link without another approval")
 
     let friendRequest = identifier("33333333")
     let strangerRequest = identifier("44444444")
