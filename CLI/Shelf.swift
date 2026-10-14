@@ -251,10 +251,10 @@ func deliverDirect(directory: String) throws {
     let descriptor = open(lockDirectory.appendingPathComponent("\(metadata.bundleIdentifier).lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
     guard descriptor >= 0 else { throw CommandError(message: "Cannot open delivery lock.") }
     defer { close(descriptor) }
-    let lockDeadline = Date().addingTimeInterval(1800)
+    let lockDeadline = Date().addingTimeInterval(900)
     while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
         guard errno == EWOULDBLOCK, Date() < lockDeadline else {
-            throw CommandError(message: "Another delivery of this app has been running for over 30 minutes.")
+            throw CommandError(message: "Another delivery of this app has been running for over 15 minutes; retry once it finishes.")
         }
         Thread.sleep(forTimeInterval: 2)
     }

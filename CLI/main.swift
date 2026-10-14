@@ -219,7 +219,7 @@ do {
     } else if arguments == ["setup-shelf-requests"] {
         try setupShelfRequests(template: repository)
     } else if arguments.first == "share-shelf" {
-        try shareShelf(options: Options(arguments.dropFirst(), allowed: ["--device", "--name", "--remove"]))
+        try shareShelf(options: Options(arguments.dropFirst(), allowed: ["--device", "--name", "--remove", "--automatic"]))
     } else {
         guard arguments.count >= 2 else { throw CommandError(message: "Use uikit-app --help") }
         switch arguments[0] {

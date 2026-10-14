@@ -102,6 +102,8 @@ do {
     try expectFailure { try verifyPersonalRemote("https://github.com.evil.invalid/lucaswkuipers/Example.git", name: "Example") }
     let localOptions = try Options(["--local-only", "--icon", "bolt"], allowed: ["--local-only", "--icon"])
     try expect(localOptions.localOnly && localOptions.values["--icon"] == "bolt", "Local-only creation must skip remote setup without consuming the next argument")
+    let automaticOptions = try Options(["--automatic"], allowed: ["--automatic", "--device"])
+    try expect(automaticOptions.automatic && automaticOptions.values.isEmpty, "Background share runs are marked without taking a value")
 
     try expect(try nextBuildNumber(nil) == "1", "Initial build number")
     try expect(try nextBuildNumber("42") == "43", "Integer build number")

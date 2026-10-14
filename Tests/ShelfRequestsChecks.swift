@@ -137,7 +137,7 @@ func testShelfRequests(directory: URL) throws {
     newer["created"] = ["timestamp": 2000.0]
     reset(rows: [], records: [older, newer])
     requests.finish(devices: shared, sharing: sharing, unavailable: [])
-    try expect(operations() == ["update-\(removed)=shared", "forceDelete-\(friendRequest)"], "An iPhone that asked again is listed once, under its newest request")
+    try expect(operations() == ["update-\(removed)=shared", "delete-\(friendRequest)"], "An iPhone that asked again is listed once, under its newest request")
 
     reset(rows: [], records: [record(friendRequest, udid: "friend-iphone", status: "removing")])
     requests.finish(devices: shared, sharing: sharing, unavailable: [])

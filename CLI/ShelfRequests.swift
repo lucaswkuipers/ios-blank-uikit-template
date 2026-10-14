@@ -267,11 +267,15 @@ struct ShelfRequests {
                     }
                 }
             }
-            let active = records.filter { devices.includes($0.udid) && ["preparing", "ready", "failed", "shared"].contains($0.status) }
+            let lasting = ["preparing", "ready", "failed", "shared", "remove-failed"]
+            let active = records.filter { devices.includes($0.udid) && lasting.contains($0.status) }
             for duplicates in Dictionary(grouping: active, by: { $0.udid.lowercased() }).values where duplicates.count > 1 {
                 for stale in duplicates.sorted(by: { $0.created > $1.created }).dropFirst() {
                     isolate(stale) {
-                        try delete(stale.name)
+                        guard let fresh = try lookup(stale.name), lasting.contains(fresh.status) else {
+                            return
+                        }
+                        try modify(["operationType": "delete", "record": ["recordName": fresh.name, "recordChangeTag": fresh.changeTag]])
                     }
                 }
             }
@@ -295,8 +299,8 @@ struct ShelfRequests {
             for record in try records() {
                 isolate(record) {
                     if record.status == "preparing" && devices.includes(record.udid) {
-                        try updateWorker(record.name, status: "failed")
                         try transition(record.name, from: ["preparing"], to: "failed", detail: detail)
+                        try updateWorker(record.name, status: "failed")
                     } else if record.status == "removing" {
                         try transition(record.name, from: ["removing"], to: "remove-failed", detail: detail)
                     }
@@ -309,74 +313,102 @@ struct ShelfRequests {
 }
 
 func processShelfRequests(store: ShelfStore) {
+    var changed = false
+    var unfinished = false
+    var removing = false
     do {
         let session = URLSession(configuration: .ephemeral, delegate: RejectRedirect(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
-        guard let requests = try ShelfRequests.load(session: session) else {
-            return
-        }
-        do {
-            try requests.relay(devices: try ShelfDevices.load())
-        } catch {
-            status("New access requests wait until the request page answers again: \(error.localizedDescription)")
-        }
-        let records = try requests.records()
-        for record in records where record.status == "declined" {
-            requests.isolate(record) {
-                try requests.updateWorker(record.name, status: "declined")
-                try requests.delete(record.name)
+        if let requests = try ShelfRequests.load(session: session) {
+            do {
+                try requests.relay(devices: try ShelfDevices.load())
+            } catch {
+                status("New access requests wait until the request page answers again: \(error.localizedDescription)")
+            }
+            let records = try requests.records()
+            for record in records where record.status == "declined" {
+                requests.isolate(record) {
+                    try requests.updateWorker(record.name, status: "declined")
+                    try requests.delete(record.name)
+                }
+            }
+            unfinished = records.contains { ["preparing", "ready", "removing"].contains($0.status) }
+            removing = records.contains { ["remove", "removing"].contains($0.status) }
+            if let lock = try tryLockShelfShare() {
+                defer { close(lock) }
+                for record in records where ["approved", "retry"].contains(record.status) {
+                    requests.isolate(record) {
+                        let added: Bool
+                        do {
+                            added = try addShelfDevice(udid: record.udid, name: record.deviceName)
+                        } catch {
+                            status("Could not approve \(record.deviceName): \(error.localizedDescription)")
+                            if try requests.transition(record.name, from: [record.status], to: "failed", detail: error.localizedDescription) {
+                                try requests.updateWorker(record.name, status: "failed")
+                            }
+                            return
+                        }
+                        changed = changed || added
+                        if try requests.transition(record.name, from: [record.status], to: "preparing", detail: "") {
+                            if record.status == "retry" {
+                                try ShelfResignMemory(failures: [:]).save()
+                            }
+                            changed = true
+                            try requests.updateWorker(record.name, status: "preparing")
+                        }
+                    }
+                }
+                let owner = try DirectConfiguration.load().deviceUDID
+                for record in records where record.status == "remove" {
+                    requests.isolate(record) {
+                        guard owner.caseInsensitiveCompare(record.udid) != .orderedSame else {
+                            try requests.transition(record.name, from: ["remove"], to: "shared", detail: "This is the shelf owner's iPhone, which always keeps access.")
+                            return
+                        }
+                        if try ShelfSharing.load().devices.contains(where: { $0.udid.caseInsensitiveCompare(record.udid) == .orderedSame }) {
+                            try removeShelfDevice(record.udid)
+                        }
+                        var memory = try ShelfResignMemory.load()
+                        memory.failures["com.lucaswkuipers.AppShelf"] = nil
+                        try memory.save()
+                        try requests.transition(record.name, from: ["remove"], to: "removing", detail: "")
+                        changed = true
+                    }
+                }
             }
         }
+    } catch {
+        status("Shelf access requests deferred until a later refresh: \(error.localizedDescription)")
+    }
+    do {
         guard try shelfShareIsIdle() else {
             return
-        }
-        var changed = false
-        for record in records where record.status == "approved" {
-            requests.isolate(record) {
-                do {
-                    try addShelfDevice(udid: record.udid, name: record.deviceName)
-                } catch {
-                    status("Could not approve \(record.deviceName): \(error.localizedDescription)")
-                    if try requests.transition(record.name, from: ["approved"], to: "failed", detail: error.localizedDescription) {
-                        try requests.updateWorker(record.name, status: "failed")
-                    }
-                    return
-                }
-                try ShelfResignMemory(failures: [:]).save()
-                if try requests.transition(record.name, from: ["approved"], to: "preparing", detail: "") {
-                    try requests.updateWorker(record.name, status: "preparing")
-                }
-                changed = true
-            }
-        }
-        let owner = try DirectConfiguration.load().deviceUDID
-        for record in records where record.status == "remove" {
-            requests.isolate(record) {
-                guard owner.caseInsensitiveCompare(record.udid) != .orderedSame else {
-                    try requests.transition(record.name, from: ["remove"], to: "shared", detail: "This is the shelf owner's iPhone, which always keeps access.")
-                    return
-                }
-                if try ShelfSharing.load().devices.contains(where: { $0.udid.caseInsensitiveCompare(record.udid) == .orderedSame }) {
-                    try removeShelfDevice(record.udid)
-                }
-                try requests.transition(record.name, from: ["remove"], to: "removing", detail: "")
-                changed = true
-            }
         }
         let (_, catalog) = try store.catalog()
         let devices = try ShelfDevices.load()
         let memory = try ShelfResignMemory.load()
-        let waitingForShelf = catalog.applications.contains { $0.bundleIdentifier == "com.lucaswkuipers.AppShelf" && !devices.isCurrent($0) && memory.blocks($0, devices: devices, at: Date()) }
+        let waitingForShelf = !removing && catalog.applications.contains { $0.bundleIdentifier == "com.lucaswkuipers.AppShelf" && !devices.isCurrent($0) && memory.blocks($0, devices: devices, at: Date()) }
         let outstanding = !outstandingResigns(catalog, devices: devices, memory: memory, at: Date()).isEmpty
-        let unfinished = records.contains { ["preparing", "ready", "removing"].contains($0.status) }
         let due = try shelfShareSpawnedBefore(Date().addingTimeInterval(-600))
         guard changed || ((outstanding || unfinished) && due && !waitingForShelf) else {
             return
         }
         try spawnShelfShare()
     } catch {
-        status("Shelf access requests deferred until a later refresh: \(error.localizedDescription)")
+        status("Shelf re-signing deferred until a later refresh: \(error.localizedDescription)")
     }
+}
+
+func tryLockShelfShare() throws -> Int32? {
+    let descriptor = open(TestFlightConfiguration.directory.appendingPathComponent("shelf-share.lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+    guard descriptor >= 0 else {
+        throw CommandError(message: "Cannot open the shelf sharing lock.")
+    }
+    guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+        close(descriptor)
+        return nil
+    }
+    return descriptor
 }
 
 func lockShelfShare() throws -> Int32 {
@@ -428,7 +460,8 @@ func spawnShelfShare() throws {
     posix_spawnattr_init(&attributes)
     defer { posix_spawnattr_destroy(&attributes) }
     posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID))
-    let argumentPointers = [executable, "share-shelf"].map { strdup($0) } + [nil]
+    posix_spawnattr_set_qos_class_np(&attributes, QOS_CLASS_UTILITY)
+    let argumentPointers = [executable, "share-shelf", "--automatic"].map { strdup($0) } + [nil]
     let environmentPointers = ProcessInfo.processInfo.environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
     defer {
         argumentPointers.forEach { free($0) }

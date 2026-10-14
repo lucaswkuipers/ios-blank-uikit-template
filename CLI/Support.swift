@@ -34,6 +34,7 @@ struct Options {
     var values: [String: String] = [:]
     var retryUpload = false
     var localOnly = false
+    var automatic = false
 
     init(_ arguments: ArraySlice<String>, allowed: Set<String>) throws {
         var remaining = Array(arguments)
@@ -48,6 +49,10 @@ struct Options {
             }
             if key == "--local-only" {
                 localOnly = true
+                continue
+            }
+            if key == "--automatic" {
+                automatic = true
                 continue
             }
             guard !remaining.isEmpty, !remaining[0].hasPrefix("--"), values[key] == nil else {

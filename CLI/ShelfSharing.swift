@@ -87,6 +87,9 @@ func appleDeviceName(_ name: String) -> String {
 func shareShelf(options: Options) throws {
     let lock = try lockShelfShare()
     defer { close(lock) }
+    if options.automatic && setpriority(PRIO_DARWIN_PROCESS, 0, 0) != 0 {
+        status("Could not lift background throttling; re-signing may run slowly.")
+    }
     let udid = options.values["--device"]
     let name = options.values["--name"]
     let removal = options.values["--remove"]
@@ -102,7 +105,8 @@ func shareShelf(options: Options) throws {
     let session = URLSession(configuration: .ephemeral, delegate: RejectRedirect(), delegateQueue: nil)
     defer { session.invalidateAndCancel() }
     let requests = try ShelfRequests.load(session: session)
-    var memory = try ShelfResignMemory.load()
+    var memory = options.automatic ? try ShelfResignMemory.load() : ShelfResignMemory(failures: [:])
+    try memory.save()
     func resign(_ application: ShelfApplication) throws {
         do {
             try resignShelfApplication(application, store: store, devices: devices)
@@ -114,16 +118,23 @@ func shareShelf(options: Options) throws {
         memory.failures[application.bundleIdentifier] = nil
         try memory.save()
     }
-    let invite: ShelfInvite
-    let unavailable: [String]
+    var invite: ShelfInvite?
+    var shelfFailure: Error?
     do {
         let (_, catalog) = try store.catalog()
         if let shelf = outstandingResigns(catalog, devices: devices, memory: memory, at: Date()).first(where: { $0.bundleIdentifier == "com.lucaswkuipers.AppShelf" }) {
             try resign(shelf)
         }
-        invite = try publishShelfInvite(store: store, devices: devices)
-        try requests?.setInstallLink(invite.pinnedLink)
+        let published = try publishShelfInvite(store: store, devices: devices)
+        try requests?.setInstallLink(published.pinnedLink)
+        invite = published
         requests?.markReady(devices: devices)
+    } catch {
+        shelfFailure = error
+        status("AppShelf is not ready for every shelf iPhone; re-signing the other apps anyway: \(error.localizedDescription)")
+    }
+    let unavailable: [String]
+    do {
         for _ in 0..<3 {
             let (_, latest) = try store.catalog()
             let batch = outstandingResigns(latest, devices: devices, memory: memory, at: Date())
@@ -140,11 +151,18 @@ func shareShelf(options: Options) throws {
         }
         let (_, final) = try store.catalog()
         unavailable = final.applications.filter { !devices.isCurrent($0) }.map(\.name)
-        requests?.finish(devices: devices, sharing: try ShelfSharing.load(), unavailable: unavailable)
     } catch {
         requests?.fail(devices: devices, detail: error.localizedDescription)
         throw error
     }
+    if let shelfFailure {
+        requests?.fail(devices: devices, detail: "AppShelf: \(shelfFailure.localizedDescription)")
+        throw shelfFailure
+    }
+    guard let invite else {
+        preconditionFailure("A successful AppShelf step always publishes the invite.")
+    }
+    requests?.finish(devices: devices, sharing: try ShelfSharing.load(), unavailable: unavailable)
     do {
         try verifyPublicDownload(invite.manifestURL, expected: invite.manifest)
     } catch {
@@ -157,7 +175,8 @@ func shareShelf(options: Options) throws {
     }
 }
 
-func addShelfDevice(udid: String, name: String) throws {
+@discardableResult
+func addShelfDevice(udid: String, name: String) throws -> Bool {
     try validate(udid, pattern: "^[A-Fa-f0-9-]{25,40}$", label: "device UDID")
     guard !name.isEmpty, name.count <= 50 else {
         throw CommandError(message: "Use a device name of 1 to 50 characters.")
@@ -167,7 +186,7 @@ func addShelfDevice(udid: String, name: String) throws {
     let known = [configuration.deviceUDID] + sharing.devices.map(\.udid)
     guard !known.contains(where: { $0.caseInsensitiveCompare(udid) == .orderedSame }) else {
         status("\(name) is already approved for the shelf.")
-        return
+        return false
     }
     let registeredName = appleDeviceName(name)
     let client = try AppStoreClient(configuration: TestFlightConfiguration.load())
@@ -187,6 +206,7 @@ func addShelfDevice(udid: String, name: String) throws {
     }
     sharing.devices.append(ShelfSharedDevice(id: device.id, udid: registered, name: registeredName))
     try sharing.save()
+    return true
 }
 
 func removeShelfDevice(_ identifier: String) throws {
@@ -217,16 +237,29 @@ func resignShelfApplication(_ application: ShelfApplication, store: ShelfStore, 
     }
     let checkout = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/Resign/\(name)")
     let credentials = ["-c", "credential.helper=", "-c", "credential.helper=!\(PersonalGitHub.executable) auth git-credential"]
-    if !files.fileExists(atPath: checkout.appendingPathComponent(".git").path) {
-        if files.fileExists(atPath: checkout.path) {
-            try files.removeItem(at: checkout)
+    func prepare() throws {
+        if !files.fileExists(atPath: checkout.appendingPathComponent(".git").path) {
+            if files.fileExists(atPath: checkout.path) {
+                try files.removeItem(at: checkout)
+            }
+            try files.createDirectory(at: checkout.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try store.github.git(checkout.deletingLastPathComponent(), credentials + ["clone", "--quiet", "--no-checkout", "https://github.com/lucaswkuipers/\(name).git", checkout.path], remote: true)
         }
-        try files.createDirectory(at: checkout.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try store.github.git(checkout.deletingLastPathComponent(), credentials + ["clone", "--quiet", "--no-checkout", "https://github.com/lucaswkuipers/\(name).git", checkout.path], remote: true)
+        try store.github.git(checkout, credentials + ["fetch", "--quiet", "origin"], remote: true)
+        try store.github.git(checkout, ["checkout", "--quiet", "--force", "--detach", current.sourceCommit], remote: false)
+        try store.github.git(checkout, ["clean", "--quiet", "-ffdx"], remote: false)
     }
-    try store.github.git(checkout, credentials + ["fetch", "--quiet", "origin"], remote: true)
-    try store.github.git(checkout, ["checkout", "--quiet", "--force", "--detach", current.sourceCommit], remote: false)
-    try store.github.git(checkout, ["clean", "--quiet", "-ffdx"], remote: false)
+    do {
+        try prepare()
+    } catch {
+        status("Recreating the re-sign checkout of \(name): \(error.localizedDescription)")
+        try files.removeItem(at: checkout)
+        do {
+            try prepare()
+        } catch {
+            throw CommandError(message: "Cannot check out \(name) at its cataloged commit \(current.sourceCommit.prefix(7)); if that commit was removed from GitHub, push a new commit to rebuild it. \(error.localizedDescription)")
+        }
+    }
     if current.bundleIdentifier == "com.lucaswkuipers.AppShelf" {
         let access = checkout.appendingPathComponent("AppShelf/ShelfAccess.generated.json")
         try files.copyItem(at: TestFlightConfiguration.directory.appendingPathComponent("shelf-access.json"), to: access)
