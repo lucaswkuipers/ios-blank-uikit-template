@@ -112,7 +112,7 @@ func testShelfRequests(directory: URL) throws {
 
     reset(rows: [row(new, udid: "FRIEND-IPHONE", status: "pending")], records: [record(own, udid: "FRIEND-IPHONE", status: "shared")])
     try requests.relay(devices: shared)
-    try expect(operations().isEmpty && MockShelfProtocol.workerUpdates == ["\(new)=ready"], "A shared iPhone asking again gets the install link without another approval")
+    try expect(operations() == ["create-\(new)=shared"] && MockShelfProtocol.workerUpdates == ["\(new)=ready"], "A shared iPhone asking again gets the install link without another approval")
 
     let friendRequest = identifier("33333333")
     let strangerRequest = identifier("44444444")

@@ -227,6 +227,9 @@ struct ShelfRequests {
             let deviceName = shelfDisplayName(request.deviceName)
             do {
                 if devices.includes(request.udid) && installable.contains(request.udid) {
+                    if try lookup(request.id) == nil {
+                        try create(name: request.id, udid: request.udid, deviceName: deviceName, model: shelfDisplayName(request.model), systemVersion: shelfDisplayName(request.systemVersion), status: "shared", detail: "")
+                    }
                     try updateWorker(request.id, status: "ready")
                     status("\(deviceName) already has access; its new request page shows the install link.")
                     continue
