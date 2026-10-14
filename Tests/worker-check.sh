@@ -58,7 +58,7 @@ device() {
 	<key>UDID</key>
 	<string>$2</string>
 	<key>VERSION</key>
-	<string>24A335</string>
+	<string>${4:-24A335}</string>
 </dict>
 </plist>
 EOF
@@ -155,7 +155,8 @@ kim="$(offer "$cancelled" Kim)"
 curl -s -o /dev/null "${admin[@]}" -d "$kim" "$base/admin/invites"
 removal="$(printf '{"token":"%s"}' "$cancelled")"
 check "unused invites can be cancelled" "$(curl -s "${admin[@]}" -d "$removal" "$base/admin/invites/remove")" '{"updated":1}'
-check "a cancelled invite is unknown" "$(curl -s -o /dev/null -w '%{http_code}' "$base/invite/$cancelled")" "404"
+check "a cancelled invite says so" "$(curl -s "$base/invite/$cancelled")" '{"status":"cancelled"}'
+check "an invite the Mac has not prepared yet is unknown" "$(curl -s -o /dev/null -w '%{http_code}' "$base/invite/$(openssl rand -hex 16)")" "404"
 check "a cancelled invite profile returns to the page" "$(curl -s -o /dev/null -w '%{http_code}' "$base/invite/$cancelled.mobileconfig")" "302"
 listed="$(printf '[{"token":"%s","request":"%s"}]' "$invite" "$used")"
 check "the Mac lists invites" "$(curl -s "${admin[@]}" "$base/admin/invites")" "$listed"
@@ -166,4 +167,12 @@ alex="$(curl -s "${admin[@]}" "$base/admin/requests" | grep -o '{"id":"[^"]*","u
 curl -s -o /dev/null "${admin[@]}" -d '{"status":"waiting"}' "$base/admin/requests/$alex"
 check "an invite takes over an open request" "$(enroll alex "$waiting")" "$base/?invite=$waiting"
 check "the taken-over request goes back to the Mac" "$(curl -s "$base/status/$alex")" '{"status":"pending","install":null}'
-printf 'Passed worker page script, hidden buttons, profile, enrollment, approval for every request, admin auth, status transitions, pinned install links, device checks, the atomic waiting cap, and single-use invites.\n'
+old="$(openssl rand -hex 16)"
+outdated="$(offer "$old" Robin)"
+curl -s -o /dev/null "${admin[@]}" -d "$outdated" "$base/admin/invites"
+device iPhone15,2 00008120-000A1B2C3D4E5F72 robin 23A341
+check "an iPhone below the minimum iOS is told to update before it uses an invite" "$(enroll robin "$old")" "$base/?invite=$old&error=system"
+check "the invite stays unused for after the update" "$(curl -s "$base/invite/$old")" '{"status":"invited","install":null,"name":"Robin"}'
+check "an iPhone below the minimum iOS is told to update before it asks" "$(enroll robin)" "$base/?error=system"
+grep -q 'showUnsupported' "$work/page.js" || { printf 'FAIL: page script cannot explain an iOS update\n'; exit 1; }
+printf 'Passed worker page script, hidden buttons, profile, enrollment, approval for every request, admin auth, status transitions, pinned install links, device checks, the atomic waiting cap, single-use and cancelled invites, and the iOS version check.\n'

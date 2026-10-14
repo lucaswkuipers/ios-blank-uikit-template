@@ -214,27 +214,30 @@ func refreshShelf() throws {
     let store = try ShelfStore()
     let catalog = try withShelfLock { try store.refresh() }
     try emit(["result": "shelf-links-refreshed", "apps": String(catalog.applications.count)])
-    processShelfRequests(store: store)
+    resumeShelfShare(catalog)
     installShelfApplications(catalog, store: store)
 }
 
 func setupShelfRefresh() throws {
     _ = try ShelfStore().catalog()
+    try installLaunchAgent(identifier: "com.lucaswkuipers.app-shelf-links", command: "refresh-shelf", interval: 60, log: "shelf-refresh")
+    try emit(["result": "shelf-refresh-ready", "intervalSeconds": "60"])
+}
+
+func installLaunchAgent(identifier: String, command: String, interval: Int, log: String) throws {
     let directory = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents")
     let logs = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/uikit-app")
     try files.createDirectory(at: directory, withIntermediateDirectories: true)
     try files.createDirectory(at: logs, withIntermediateDirectories: true)
-    let identifier = "com.lucaswkuipers.app-shelf-links"
     let path = directory.appendingPathComponent("\(identifier).plist")
     let executable = files.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/uikit-app").path
-    let properties: [String: Any] = ["Label": identifier, "ProgramArguments": [executable, "refresh-shelf"], "StartInterval": 60, "RunAtLoad": true, "ProcessType": "Standard", "StandardOutPath": logs.appendingPathComponent("shelf-refresh.log").path, "StandardErrorPath": logs.appendingPathComponent("shelf-refresh-error.log").path]
+    let properties: [String: Any] = ["Label": identifier, "ProgramArguments": [executable, command], "StartInterval": interval, "RunAtLoad": true, "ProcessType": "Standard", "StandardOutPath": logs.appendingPathComponent("\(log).log").path, "StandardErrorPath": logs.appendingPathComponent("\(log)-error.log").path]
     try PropertyListSerialization.data(fromPropertyList: properties, format: .xml, options: 0).write(to: path, options: .atomic)
     let domain = "gui/\(getuid())"
     _ = try? run("/bin/launchctl", ["bootout", "\(domain)/\(identifier)"], log: nil)
     for attempt in 0..<10 {
         do {
             try run("/bin/launchctl", ["bootstrap", domain, path.path], log: nil)
-            try emit(["result": "shelf-refresh-ready", "intervalSeconds": "60"])
             return
         } catch {
             if attempt == 9 { throw error }

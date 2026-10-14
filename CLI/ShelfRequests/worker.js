@@ -33,6 +33,12 @@ function back(request, query) {
   return Response.redirect(`${new URL(request.url).origin}/?${query}`, 301)
 }
 
+function supported(env, version) {
+  const minimum = parseInt((env.MINIMUM_SYSTEM || "").split(".")[0], 10)
+  const build = parseInt(version, 10)
+  return !(minimum >= 26 && build > 0) || build >= minimum - 3
+}
+
 async function body(request) {
   try {
     const value = await request.json()
@@ -79,6 +85,9 @@ async function enroll(request, env) {
   const device = { udid, model, name: clean(attribute(plist, "DEVICE_NAME"), 50) || "iPhone", systemVersion: clean(attribute(plist, "VERSION"), 20) }
   const now = new Date().toISOString()
   const invite = new URL(request.url).searchParams.get("invite") ?? ""
+  if (!supported(env, device.systemVersion)) {
+    return back(request, inviteToken.test(invite) ? `invite=${invite}&error=system` : "error=system")
+  }
   if (inviteToken.test(invite) && await claim(env, invite, device, now)) {
     return back(request, `invite=${invite}`)
   }
@@ -113,7 +122,8 @@ async function requestStatus(id, env) {
 async function inviteStatus(invite, env) {
   const row = await env.DB.prepare("SELECT name, request FROM invites WHERE token = ?").bind(invite).first()
   if (!row) {
-    return json({ status: "unknown" }, 404)
+    const cancelled = await env.DB.prepare("SELECT token FROM cancelled_invites WHERE token = ?").bind(invite).first()
+    return json({ status: cancelled ? "cancelled" : "unknown" }, 404)
   }
   const current = row.request ? await state(row.request, env) : null
   return json({ status: "invited", install: null, ...current, name: row.name }, 200)
@@ -172,8 +182,11 @@ async function administer(request, env, path) {
     if (typeof token !== "string" || !inviteToken.test(token)) {
       return json({ error: "invalid invite" }, 400)
     }
-    const result = await env.DB.prepare("DELETE FROM invites WHERE token = ? AND request IS NULL").bind(token).run()
-    return json({ updated: result.meta.changes }, 200)
+    const results = await env.DB.batch([
+      env.DB.prepare("INSERT OR IGNORE INTO cancelled_invites (token, cancelled_at) SELECT token, ? FROM invites WHERE token = ? AND request IS NULL").bind(new Date().toISOString(), token),
+      env.DB.prepare("DELETE FROM invites WHERE token = ? AND request IS NULL").bind(token)
+    ])
+    return json({ updated: results[1].meta.changes }, 200)
   }
   return json({ error: "not found" }, 404)
 }
@@ -223,6 +236,7 @@ function page(env) {
   const invite = /^[0-9a-f]{32}$/.test(parameters.get("invite") ?? "") ? parameters.get("invite") : null
   const opened = Date.now()
   let shown = ""
+  let timer = null
   let request = parameters.get("request")
   try {
     if (request) {
@@ -231,7 +245,9 @@ function page(env) {
       request = localStorage.getItem("request")
     }
   } catch {}
-  if (parameters.has("request") || parameters.has("error")) {
+  if (invite && parameters.has("error")) {
+    history.replaceState(null, "", "/?invite=" + invite)
+  } else if (!invite && (parameters.has("request") || parameters.has("error"))) {
     history.replaceState(null, "", "/")
   }
   const agent = navigator.userAgent
@@ -259,6 +275,11 @@ function page(env) {
     }))
   }
 
+  function schedule(delay) {
+    clearTimeout(timer)
+    timer = setTimeout(refresh, delay)
+  }
+
   function offer(text, label, link) {
     if (!onDevice) {
       show("Open this link on your iPhone.", "AppShelf installs " + owner + "'s apps on the iPhone that opens this page.")
@@ -267,7 +288,7 @@ function page(env) {
     } else {
       show(text, "The profile only shares this iPhone's device ID, and it removes itself right away." + requirement, link, label, [
         "Tap " + label + " below, then tap Allow.",
-        "Open Settings, tap Profile Downloaded near the top, then tap Install and enter your passcode.",
+        "Open Settings and tap Profile Downloaded near the top (or General, then VPN & Device Management). Tap Install and enter your passcode.",
         "Safari opens this page again and finishes by itself."
       ])
     }
@@ -286,16 +307,24 @@ function page(env) {
       return await response.json()
     } catch {
       show("Can't reach AppShelf right now.", "This page tries again automatically.")
-      setTimeout(refresh, 15000)
+      schedule(15000)
       return null
     }
   }
 
   function showReady(greeting, link) {
-    show(greeting + "This iPhone is ready.", "Tap Install AppShelf, then Install. Open AppShelf from your Home Screen, allow notifications, and install the apps you want. A few apps can take a little longer." + requirement, link, "Install AppShelf")
+    show(greeting + "This iPhone is ready.", "Tap Install AppShelf, then Install. Open AppShelf from your Home Screen, allow notifications, and install the apps you want." + (inSafari ? "" : " If nothing happens, open this page in Safari."), link, "Install AppShelf")
+  }
+
+  function showUnsupported() {
+    show("This iPhone needs iOS " + (minimum || "a newer version") + " or later.", "Update it in Settings, then General, then Software Update. Then open this link again.")
   }
 
   async function refreshInvite() {
+    if (failure === "system") {
+      showUnsupported()
+      return
+    }
     const state = await fetchState("/invite/" + invite)
     if (!state) {
       return
@@ -304,21 +333,21 @@ function page(env) {
     switch (state.status) {
     case "invited":
       offer(greeting + "You're invited to get " + owner + "'s apps on this iPhone.", "Get Started", "/invite/" + invite + ".mobileconfig")
-      setTimeout(refresh, 10000)
+      schedule(10000)
       return
     case "pending":
     case "approved":
     case "preparing":
-      show(greeting + "Setting up AppShelf for this iPhone…", "This usually takes a minute or two. Keep this page open; it updates by itself.")
-      setTimeout(refresh, 5000)
+      show(greeting + "Setting up AppShelf for this iPhone…", "This usually takes about a minute. Keep this page open; it updates by itself.")
+      schedule(5000)
       return
     case "waiting":
       show(greeting + "Waiting for " + owner + " to confirm this iPhone.", "This page updates by itself once it's confirmed.")
-      setTimeout(refresh, 10000)
+      schedule(10000)
       return
     case "failed":
       show(greeting + "Setup did not finish yet.", owner + " can see the problem and will try again. This page updates by itself.")
-      setTimeout(refresh, 30000)
+      schedule(30000)
       return
     case "ready":
       showReady(greeting, state.install)
@@ -327,13 +356,12 @@ function page(env) {
     case "removed":
       show("This invite is no longer active.", "Ask " + owner + " if you still need access.")
       return
+    case "cancelled":
+      show("This invite was cancelled or has expired.", "Ask " + owner + " to send you a new one.")
+      return
     default:
-      if (Date.now() - opened < 180000) {
-        show("Getting your invite ready…", "This takes up to a minute.")
-        setTimeout(refresh, 5000)
-      } else {
-        show("This invite link doesn't work anymore.", "Ask " + owner + " to send you a new one.")
-      }
+      show("Getting your invite ready…", "This usually takes a few seconds. It needs " + owner + "'s Mac to be online, so this page keeps trying.")
+      schedule(Date.now() - opened < 120000 ? 5000 : 30000)
       return
     }
   }
@@ -341,6 +369,10 @@ function page(env) {
   async function refreshRequest() {
     if (failure === "busy") {
       show("Too many requests are waiting.", owner + " has too many open requests right now. Try again later.")
+      return
+    }
+    if (failure === "system") {
+      showUnsupported()
       return
     }
     if (failure) {
@@ -362,11 +394,11 @@ function page(env) {
       break
     case "approved":
     case "preparing":
-      show(owner + " approved this iPhone.", "Setting up AppShelf for this iPhone. This usually takes a minute or two.")
+      show(owner + " approved this iPhone.", "Setting up AppShelf for this iPhone. This usually takes about a minute.")
       break
     case "failed":
       show(owner + " approved this iPhone, but setup did not finish yet.", owner + " can see the problem and will try again. This page updates when it's ready.")
-      setTimeout(refresh, 30000)
+      schedule(30000)
       return
     case "ready":
       showReady("", state.install)
@@ -384,10 +416,16 @@ function page(env) {
       offer("Get " + owner + "'s apps on this iPhone.", "Request Access", "/request.mobileconfig")
       return
     }
-    setTimeout(refresh, 10000)
+    schedule(10000)
   }
 
   const refresh = invite ? refreshInvite : refreshRequest
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      clearTimeout(timer)
+      refresh()
+    }
+  })
   refresh()
 </script>
 </body>

@@ -388,10 +388,8 @@ struct ShelfRequests {
     }
 }
 
-func processShelfRequests(store: ShelfStore) {
+func processShelfRequests() {
     var changed = false
-    var unfinished = false
-    var removing = false
     do {
         let session = URLSession(configuration: .ephemeral, delegate: RejectRedirect(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
@@ -419,8 +417,6 @@ func processShelfRequests(store: ShelfStore) {
                     try requests.delete(record.name)
                 }
             }
-            unfinished = records.contains { ["preparing", "ready", "removing"].contains($0.status) }
-            removing = records.contains { ["remove", "removing"].contains($0.status) }
             if let lock = try tryLockShelfShare() {
                 defer { close(lock) }
                 for record in records where ["approved", "retry"].contains(record.status) {
@@ -467,17 +463,34 @@ func processShelfRequests(store: ShelfStore) {
     } catch {
         status("Shelf access requests deferred until a later refresh: \(error.localizedDescription)")
     }
+    guard changed else {
+        return
+    }
     do {
         guard try shelfShareIsIdle() else {
             return
         }
-        let (_, catalog) = try store.catalog()
+        try spawnShelfShare()
+    } catch {
+        status("Shelf re-signing deferred until a later refresh: \(error.localizedDescription)")
+    }
+}
+
+func resumeShelfShare(_ catalog: ShelfCatalog) {
+    do {
+        guard try shelfShareIsIdle(), try shelfShareSpawnedBefore(Date().addingTimeInterval(-600)) else {
+            return
+        }
+        let session = URLSession(configuration: .ephemeral, delegate: RejectRedirect(), delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+        let records = try ShelfRequests.load(session: session)?.records() ?? []
+        let unfinished = records.contains { ["preparing", "ready", "removing"].contains($0.status) }
+        let removing = records.contains { ["remove", "removing"].contains($0.status) }
         let devices = try ShelfDevices.load()
         let memory = try ShelfResignMemory.load()
         let waitingForShelf = !removing && catalog.applications.contains { $0.bundleIdentifier == "com.lucaswkuipers.AppShelf" && !devices.isCurrent($0) && memory.blocks($0, devices: devices, at: Date()) }
         let outstanding = !outstandingResigns(catalog, devices: devices, memory: memory, at: Date()).isEmpty
-        let due = try shelfShareSpawnedBefore(Date().addingTimeInterval(-600))
-        guard changed || ((outstanding || unfinished) && due && !waitingForShelf) else {
+        guard (outstanding || unfinished) && !waitingForShelf else {
             return
         }
         try spawnShelfShare()
@@ -763,5 +776,6 @@ func setupShelfRequests(template: URL) throws {
     let qrCode = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/ShelfInvite/AppShelf-request.png")
     try files.createDirectory(at: qrCode.deletingLastPathComponent(), withIntermediateDirectories: true)
     try writeQRCode("\(url)/", to: qrCode)
-    try emit(["result": "shelf-requests-ready", "requestLink": "\(url)/", "qrCode": qrCode.path])
+    try installLaunchAgent(identifier: "com.lucaswkuipers.app-shelf-requests", command: "refresh-shelf-requests", interval: 15, log: "shelf-requests")
+    try emit(["result": "shelf-requests-ready", "requestLink": "\(url)/", "qrCode": qrCode.path, "intervalSeconds": "15"])
 }

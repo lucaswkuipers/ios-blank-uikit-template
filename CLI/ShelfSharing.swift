@@ -122,6 +122,15 @@ func shareShelf(options: Options) throws {
     var shelfFailure: Error?
     do {
         let (_, catalog) = try store.catalog()
+        for bundleIdentifier in resignShelfPackages(outstandingResigns(catalog, devices: devices, memory: memory, at: Date()), store: store, devices: devices) {
+            memory.failures[bundleIdentifier] = nil
+        }
+        try memory.save()
+    } catch {
+        status("Could not re-sign the shelf in one batch; each app is retried on its own: \(error.localizedDescription)")
+    }
+    do {
+        let (_, catalog) = try store.catalog()
         if let shelf = outstandingResigns(catalog, devices: devices, memory: memory, at: Date()).first(where: { $0.bundleIdentifier == "com.lucaswkuipers.AppShelf" }) {
             try resign(shelf)
         }
@@ -163,10 +172,12 @@ func shareShelf(options: Options) throws {
         preconditionFailure("A successful AppShelf step always publishes the invite.")
     }
     requests?.finish(devices: devices, sharing: try ShelfSharing.load(), unavailable: unavailable)
-    do {
-        try verifyPublicDownload(invite.manifestURL, expected: invite.manifest)
-    } catch {
-        status("The invite link may install the previous AppShelf build for a few more minutes: \(error.localizedDescription)")
+    if !options.automatic {
+        do {
+            try verifyPublicDownload(invite.manifestURL, expected: invite.manifest)
+        } catch {
+            status("The invite link may install the previous AppShelf build for a few more minutes: \(error.localizedDescription)")
+        }
     }
     let shared = try ShelfSharing.load().devices.map(\.name).joined(separator: ", ")
     try emit(["result": "shelf-shared", "sharedWith": shared, "invite": invite.link, "qrCode": invite.qrCode.path, "pendingApps": String(unavailable.count)])
@@ -226,13 +237,10 @@ func resignShelfApplication(_ application: ShelfApplication, store: ShelfStore, 
     guard let current = catalog.applications.first(where: { $0.bundleIdentifier == application.bundleIdentifier }), !devices.isCurrent(current) else {
         return
     }
-    let asset = try store.decoder.decode(ShelfAsset.self, from: Data(store.github.call(["api", "repos/\(ShelfStore.repository)/releases/assets/\(current.packageAssetID)"]).utf8))
-    try validate(asset.name, pattern: "^[A-Za-z][A-Za-z0-9]*\\.ipa$", label: "shelf package name")
-    try validate(current.sourceCommit, pattern: "^[0-9a-f]{40}$", label: "cataloged source commit")
-    let name = String(asset.name.dropLast(".ipa".count))
+    let name = try shelfPackageName(current, store: store)
     _ = try store.github.repository(name: name)
     do {
-        try resignShelfPackage(current, name: name, store: store, devices: devices)
+        try catalogResignedPackages([try resignedShelfPackage(current, name: name, store: store, devices: devices)], store: store)
     } catch {
         status("Rebuilding \(current.name) because its package could not be re-signed directly: \(error.localizedDescription)")
         try rebuildShelfApplication(current, name: name, store: store, devices: devices)
@@ -243,7 +251,60 @@ func resignShelfApplication(_ application: ShelfApplication, store: ShelfStore, 
     }
 }
 
-func resignShelfPackage(_ current: ShelfApplication, name: String, store: ShelfStore, devices: ShelfDevices) throws {
+func shelfPackageName(_ application: ShelfApplication, store: ShelfStore) throws -> String {
+    let asset = try store.decoder.decode(ShelfAsset.self, from: Data(store.github.call(["api", "repos/\(ShelfStore.repository)/releases/assets/\(application.packageAssetID)"]).utf8))
+    try validate(asset.name, pattern: "^[A-Za-z][A-Za-z0-9]*\\.ipa$", label: "shelf package name")
+    try validate(application.sourceCommit, pattern: "^[0-9a-f]{40}$", label: "cataloged source commit")
+    return String(asset.name.dropLast(".ipa".count))
+}
+
+func resignShelfPackages(_ applications: [ShelfApplication], store: ShelfStore, devices: ShelfDevices) -> [String] {
+    let lock = NSLock()
+    var resigned: [ShelfApplication] = []
+    let queue = OperationQueue()
+    queue.maxConcurrentOperationCount = 4
+    for application in applications {
+        queue.addOperation {
+            do {
+                let package = try resignedShelfPackage(application, name: try shelfPackageName(application, store: store), store: store, devices: devices)
+                lock.withLock {
+                    resigned.append(package)
+                }
+            } catch {
+                status("Could not re-sign \(application.name) directly; it is retried on its own: \(error.localizedDescription)")
+            }
+        }
+    }
+    queue.waitUntilAllOperationsAreFinished()
+    guard !resigned.isEmpty else {
+        return []
+    }
+    do {
+        try catalogResignedPackages(resigned, store: store)
+    } catch {
+        status("Could not add the re-signed apps to the catalog; each is retried on its own: \(error.localizedDescription)")
+        return []
+    }
+    return resigned.map(\.bundleIdentifier)
+}
+
+func catalogResignedPackages(_ applications: [ShelfApplication], store: ShelfStore) throws {
+    try withShelfLock {
+        let (release, latest) = try store.catalog()
+        var catalog = latest
+        for application in applications {
+            guard let index = catalog.applications.firstIndex(where: { $0.bundleIdentifier == application.bundleIdentifier }),
+                  catalog.applications[index].sourceCommit == application.sourceCommit, catalog.applications[index].build == application.build else {
+                continue
+            }
+            catalog.applications[index] = application
+        }
+        try store.updateBody(catalog, releaseID: release.id)
+        _ = try store.refresh()
+    }
+}
+
+func resignedShelfPackage(_ current: ShelfApplication, name: String, store: ShelfStore, devices: ShelfDevices) throws -> ShelfApplication {
     let configuration = try DirectConfiguration.load()
     let work = files.temporaryDirectory.appendingPathComponent("shelf-resign-\(UUID().uuidString)")
     try files.createDirectory(at: work, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -310,19 +371,8 @@ func resignShelfPackage(_ current: ShelfApplication, name: String, store: ShelfS
     let data = try Data(contentsOf: package, options: .mappedIfSafe)
     let sha256 = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     let intent = ["sourceCommit": current.sourceCommit, "bundleIdentifier": current.bundleIdentifier, "build": current.build, "deviceSet": devices.identifier]
-    let application = try publishShelfArtifact(store: store, tag: "\(name)-\(current.build)-\(current.sourceCommit.prefix(12))-\(devices.identifier)", title: "\(name) \(current.version) (\(current.build))", intent: intent, package: package, assetName: "\(name).ipa", size: data.count, sha256: sha256) { asset in
+    return try publishShelfArtifact(store: store, tag: "\(name)-\(current.build)-\(current.sourceCommit.prefix(12))-\(devices.identifier)", title: "\(name) \(current.version) (\(current.build))", intent: intent, package: package, assetName: "\(name).ipa", size: data.count, sha256: sha256) { asset in
         ShelfApplication(name: current.name, bundleIdentifier: current.bundleIdentifier, version: current.version, build: current.build, minimumOSVersion: current.minimumOSVersion, profileExpiration: expiration, sourceCommit: current.sourceCommit, sha256: sha256, size: data.count, packageAssetID: asset.id, publishedAt: current.publishedAt, manifestAssetID: nil, installExpiration: nil, iconPNG: current.iconPNG, notificationTitle: current.notificationTitle, deviceSet: devices.identifier, silent: true, releaseNotes: current.releaseNotes)
-    }
-    try withShelfLock {
-        let (release, latest) = try store.catalog()
-        guard let index = latest.applications.firstIndex(where: { $0.bundleIdentifier == current.bundleIdentifier }),
-              latest.applications[index].sourceCommit == current.sourceCommit, latest.applications[index].build == current.build else {
-            return
-        }
-        var catalog = latest
-        catalog.applications[index] = application
-        try store.updateBody(catalog, releaseID: release.id)
-        _ = try store.refresh()
     }
 }
 

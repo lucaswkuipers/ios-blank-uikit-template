@@ -21,6 +21,11 @@ CREATE TABLE IF NOT EXISTS invites (
 
 CREATE UNIQUE INDEX IF NOT EXISTS invite_request ON invites (request) WHERE request IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS cancelled_invites (
+  token TEXT PRIMARY KEY,
+  cancelled_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL

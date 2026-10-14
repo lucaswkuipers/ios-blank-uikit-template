@@ -188,6 +188,7 @@ do {
         uikit-app setup-shelf-installs
         uikit-app share-shelf [--device <iPhone-UDID> --name <device-name> | --remove <device-name-or-UDID>]
         uikit-app setup-shelf-requests
+        uikit-app refresh-shelf-requests
         uikit-app setup-testflight --key <file.p8> --key-id <ID> --issuer <UUID> --tester <email> --account-bundle <existing-personal-bundle-ID>
 
         Creates from the programmatic UIKit template and integrates an Icon Studio icon.
@@ -204,8 +205,9 @@ do {
         login performs the occasional Apple CLI password/2FA sign-in in Terminal.
         share-shelf approves another iPhone for every shelf app, or removes one, re-signs the shelf apps,
         and prints the AppShelf install link and QR code. Without options, it resumes and reprints them.
-        setup-shelf-requests deploys the free Cloudflare request page: people open its link, their iPhone
-        sends its device ID, and AppShelf asks the owner to approve before the Mac re-signs the shelf.
+        setup-shelf-requests deploys the free Cloudflare request page: people open a personal invite from
+        AppShelf (or ask through the bare link), their iPhone sends its device ID, and the Mac re-signs the
+        shelf for it. refresh-shelf-requests handles invites and requests; a launch agent runs it every 15 seconds.
         Personal defaults: ~/.config/uikit-app/config.json (team, bundlePrefix, and delivery).
         """)
     } else if arguments == ["login"] {
@@ -218,6 +220,8 @@ do {
         try setupShelfInstalls()
     } else if arguments == ["setup-shelf-requests"] {
         try setupShelfRequests(template: repository)
+    } else if arguments == ["refresh-shelf-requests"] {
+        processShelfRequests()
     } else if arguments.first == "share-shelf" {
         try shareShelf(options: Options(arguments.dropFirst(), allowed: ["--device", "--name", "--remove", "--automatic"]))
     } else {
