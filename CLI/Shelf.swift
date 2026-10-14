@@ -226,7 +226,7 @@ func setupShelfRefresh() throws {
     let identifier = "com.lucaswkuipers.app-shelf-links"
     let path = directory.appendingPathComponent("\(identifier).plist")
     let executable = files.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/uikit-app").path
-    let properties: [String: Any] = ["Label": identifier, "ProgramArguments": [executable, "refresh-shelf"], "StartInterval": 60, "RunAtLoad": true, "ProcessType": "Background", "StandardOutPath": logs.appendingPathComponent("shelf-refresh.log").path, "StandardErrorPath": logs.appendingPathComponent("shelf-refresh-error.log").path]
+    let properties: [String: Any] = ["Label": identifier, "ProgramArguments": [executable, "refresh-shelf"], "StartInterval": 60, "RunAtLoad": true, "ProcessType": "Standard", "StandardOutPath": logs.appendingPathComponent("shelf-refresh.log").path, "StandardErrorPath": logs.appendingPathComponent("shelf-refresh-error.log").path]
     try PropertyListSerialization.data(fromPropertyList: properties, format: .xml, options: 0).write(to: path, options: .atomic)
     let domain = "gui/\(getuid())"
     _ = try? run("/bin/launchctl", ["bootout", "\(domain)/\(identifier)"], log: nil)
