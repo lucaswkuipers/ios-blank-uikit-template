@@ -687,7 +687,7 @@ func setupShelfRequests(template: URL) throws {
     }
     let directory = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/ShelfRequests")
     try files.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-    for file in ["worker.js", "schema.sql"] {
+    for file in ["worker.js", "downloads.mjs", "schema.sql"] {
         let destination = directory.appendingPathComponent(file)
         if files.fileExists(atPath: destination.path) {
             try files.removeItem(at: destination)
@@ -762,7 +762,16 @@ func setupShelfRequests(template: URL) throws {
     let saved = try ShelfRequestsConfiguration.load()
     let adminToken = try saved?.adminToken ?? run("/usr/bin/openssl", ["rand", "-hex", "32"], log: nil)
     let secrets = directory.appendingPathComponent("secrets.json")
-    try JSONEncoder().encode(["ADMIN_TOKEN": adminToken]).write(to: secrets)
+    struct ArtifactAccess: Decodable {
+        let token: String
+    }
+    let access = try JSONDecoder().decode(
+        ArtifactAccess.self,
+        from: Data(contentsOf: TestFlightConfiguration.directory.appendingPathComponent("shelf-access.json")))
+    guard access.token.hasPrefix("github_pat_"), !access.token.contains(where: \.isWhitespace) else {
+        throw CommandError(message: "Cloud downloads need the shelf's artifact-only read credential.")
+    }
+    try JSONEncoder().encode(["ADMIN_TOKEN": adminToken, "ARTIFACT_TOKEN": access.token]).write(to: secrets)
     try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: secrets.path)
     defer { try? files.removeItem(at: secrets) }
     let profile = directory.appendingPathComponent("request.mobileconfig")

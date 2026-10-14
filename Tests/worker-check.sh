@@ -11,7 +11,8 @@ base="http://127.0.0.1:$port"
 token="$(openssl rand -hex 32)"
 prefix="itms-services://?action=download-manifest&url=https://gist.githubusercontent.com/lucaswkuipers/0123456789abcdef/raw/"
 
-cp "$repository/CLI/ShelfRequests/worker.js" "$repository/CLI/ShelfRequests/schema.sql" "$work/"
+node --test "$repository/Tests/ShelfDownloadChecks.mjs"
+cp "$repository/CLI/ShelfRequests/worker.js" "$repository/CLI/ShelfRequests/downloads.mjs" "$repository/CLI/ShelfRequests/schema.sql" "$work/"
 printf 'profile fixture' > "$work/request.mobileconfig"
 cat > "$work/wrangler.toml" <<EOF
 name = "appshelf"

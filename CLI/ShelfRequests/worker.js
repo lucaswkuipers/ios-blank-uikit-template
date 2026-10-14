@@ -1,4 +1,5 @@
 import profile from "./request.mobileconfig"
+import { download } from "./downloads.mjs"
 
 const statuses = ["pending", "waiting", "approved", "preparing", "ready", "failed", "declined", "removed"]
 const inviteToken = /^[0-9a-f]{32}$/
@@ -456,6 +457,9 @@ function page(env) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url)
+    if (url.pathname.startsWith("/download/")) {
+      return download(request, env)
+    }
     if (url.pathname.startsWith("/admin/")) {
       return administer(request, env, url.pathname)
     }
