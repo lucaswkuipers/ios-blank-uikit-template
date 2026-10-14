@@ -131,6 +131,14 @@ func testShelfRequests(directory: URL) throws {
     requests.finish(devices: ShelfDevices(configuration: owner, sharing: ShelfSharing(devices: [], inviteGist: nil)), sharing: ShelfSharing(devices: [], inviteGist: nil), unavailable: [])
     try expect(operations() == ["forceDelete-\(friendRequest)"] && MockShelfProtocol.workerUpdates == ["\(friendRequest)=removed"], "Removing an iPhone from the command line also removes it from AppShelf")
 
+    var older = record(friendRequest, udid: "friend-iphone", status: "shared")
+    older["created"] = ["timestamp": 1000.0]
+    var newer = record(removed, udid: "FRIEND-IPHONE", status: "ready")
+    newer["created"] = ["timestamp": 2000.0]
+    reset(rows: [], records: [older, newer])
+    requests.finish(devices: shared, sharing: sharing, unavailable: [])
+    try expect(operations() == ["update-\(removed)=shared", "forceDelete-\(friendRequest)"], "An iPhone that asked again is listed once, under its newest request")
+
     reset(rows: [], records: [record(friendRequest, udid: "friend-iphone", status: "removing")])
     requests.finish(devices: shared, sharing: sharing, unavailable: [])
     try expect(operations() == ["update-\(friendRequest)=remove-failed"], "A removal that did not apply stops in a visible state")

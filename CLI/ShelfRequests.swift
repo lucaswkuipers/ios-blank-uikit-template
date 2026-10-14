@@ -30,6 +30,7 @@ struct ShelfAccessRecord {
     let deviceName: String
     let status: String
     let detail: String
+    let created: Double
 
     init(_ record: [String: Any]) throws {
         let fields = record["fields"] as? [String: Any] ?? [:]
@@ -46,6 +47,7 @@ struct ShelfAccessRecord {
         self.deviceName = deviceName
         self.status = status
         detail = value("detail") ?? ""
+        created = (record["created"] as? [String: Any])?["timestamp"] as? Double ?? 0
     }
 }
 
@@ -265,6 +267,14 @@ struct ShelfRequests {
                     }
                 }
             }
+            let active = records.filter { devices.includes($0.udid) && ["preparing", "ready", "failed", "shared"].contains($0.status) }
+            for duplicates in Dictionary(grouping: active, by: { $0.udid.lowercased() }).values where duplicates.count > 1 {
+                for stale in duplicates.sorted(by: { $0.created > $1.created }).dropFirst() {
+                    isolate(stale) {
+                        try delete(stale.name)
+                    }
+                }
+            }
             let recorded = Set(records.filter { !["declined", "failed"].contains($0.status) }.map { $0.udid.lowercased() })
             for device in sharing.devices where !recorded.contains(device.udid.lowercased()) {
                 do {
@@ -354,10 +364,13 @@ func processShelfRequests(store: ShelfStore) {
             }
         }
         let (_, catalog) = try store.catalog()
-        let outstanding = !outstandingResigns(catalog, devices: try ShelfDevices.load(), memory: try ShelfResignMemory.load(), at: Date()).isEmpty
+        let devices = try ShelfDevices.load()
+        let memory = try ShelfResignMemory.load()
+        let waitingForShelf = catalog.applications.contains { $0.bundleIdentifier == "com.lucaswkuipers.AppShelf" && !devices.isCurrent($0) && memory.blocks($0, devices: devices, at: Date()) }
+        let outstanding = !outstandingResigns(catalog, devices: devices, memory: memory, at: Date()).isEmpty
         let unfinished = records.contains { ["preparing", "ready", "removing"].contains($0.status) }
         let due = try shelfShareSpawnedBefore(Date().addingTimeInterval(-600))
-        guard changed || ((outstanding || unfinished) && due) else {
+        guard changed || ((outstanding || unfinished) && due && !waitingForShelf) else {
             return
         }
         try spawnShelfShare()
