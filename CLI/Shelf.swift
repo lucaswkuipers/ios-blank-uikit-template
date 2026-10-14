@@ -235,7 +235,7 @@ func withShelfLock<T>(_ operation: () throws -> T) throws -> T {
     let descriptor = open(path.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
     guard descriptor >= 0 else { throw CommandError(message: "Cannot open shelf lock.") }
     defer { close(descriptor) }
-    let deadline = Date().addingTimeInterval(30)
+    let deadline = Date().addingTimeInterval(180)
     while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
         guard errno == EWOULDBLOCK, Date() < deadline else {
             throw CommandError(message: "Another shelf catalog update is still running. Retry shortly.")

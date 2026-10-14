@@ -233,7 +233,7 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
             throw CommandError(message: "The build preparation script must be a Swift file inside the app repository.")
         }
         status("Preparing \(metadata.name)'s Xcode project…")
-        try run("/usr/bin/swift", [script.path], log: nil)
+        try run("/usr/bin/swift", [script.path], log: nil, environment: ProcessInfo.processInfo.environment)
         guard try PersonalGitHub().git(root, ["status", "--porcelain"], remote: false).isEmpty else {
             throw CommandError(message: "Build preparation changed tracked sources. Commit the generated source changes before publishing.")
         }
