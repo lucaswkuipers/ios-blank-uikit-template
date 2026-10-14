@@ -253,11 +253,13 @@ struct ShelfRequests {
         }
     }
 
-    func relay(devices: ShelfDevices) throws {
+    @discardableResult
+    func relay(devices: ShelfDevices) throws -> [String] {
         let pending = try JSONDecoder().decode([ShelfWorkerRequest].self, from: workerRequest("/admin/requests", body: nil))
         guard !pending.isEmpty else {
-            return
+            return []
         }
+        var invited: [String] = []
         let installable = Set(try records().filter { ["ready", "shared"].contains($0.status) }.map { $0.udid.lowercased() })
         for request in pending {
             var deviceName = shelfDisplayName(request.deviceName)
@@ -287,6 +289,7 @@ struct ShelfRequests {
                     }
                     try delete(invitation.name)
                     try updateWorker(request.id, status: "approved")
+                    invited.append(request.id)
                     status("\(deviceName) opened their invite; adding their iPhone.")
                     continue
                 }
@@ -304,6 +307,7 @@ struct ShelfRequests {
                 status("Could not pass on the request from \(deviceName); a later refresh retries: \(error.localizedDescription)")
             }
         }
+        return invited
     }
 
     func markReady(devices: ShelfDevices) {
@@ -397,12 +401,18 @@ func processShelfRequests(store: ShelfStore) {
             } catch {
                 status("Invites wait until the request page answers again: \(error.localizedDescription)")
             }
+            var invited: [String] = []
             do {
-                try requests.relay(devices: try ShelfDevices.load())
+                invited = try requests.relay(devices: try ShelfDevices.load())
             } catch {
                 status("New access requests wait until the request page answers again: \(error.localizedDescription)")
             }
-            let records = try requests.records()
+            var records = try requests.records()
+            for name in invited where !records.contains(where: { $0.name == name }) {
+                if let record = try requests.lookup(name) {
+                    records.append(record)
+                }
+            }
             for record in records where record.status == "declined" {
                 requests.isolate(record) {
                     try requests.updateWorker(record.name, status: "declined")

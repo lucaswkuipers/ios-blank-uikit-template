@@ -129,8 +129,9 @@ func testShelfRequests(directory: URL) throws {
     }
 
     reset(rows: [invited(new, udid: "stranger-iphone")], records: [invitation(token, name: "Sam", created: Date())])
-    try requests.relay(devices: shared)
+    let approved = try requests.relay(devices: shared)
     try expect(operations() == ["create-\(new)=approved", "forceDelete-invite-\(token)"] && field("deviceName", of: 0) == "Sam", "An invite approves its iPhone under the invited name and is used up")
+    try expect(approved == [new], "The refresh learns which invites it approved, so it can start setup before CloudKit's query index catches up")
     try expect(MockShelfProtocol.workerUpdates == ["\(new)=approved"], "The invited visitor sees setup start without waiting for the owner")
 
     reset(rows: [invited(new, udid: "stranger-iphone")], records: [record(new, udid: "stranger-iphone", status: "approved")])
