@@ -305,7 +305,11 @@ func processShelfRequests(store: ShelfStore) {
         guard let requests = try ShelfRequests.load(session: session) else {
             return
         }
-        try requests.relay(devices: try ShelfDevices.load())
+        do {
+            try requests.relay(devices: try ShelfDevices.load())
+        } catch {
+            status("New access requests wait until the request page answers again: \(error.localizedDescription)")
+        }
         let records = try requests.records()
         for record in records where record.status == "declined" {
             requests.isolate(record) {
