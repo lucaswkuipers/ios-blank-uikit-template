@@ -19,6 +19,7 @@ struct ShelfApplication: Codable {
     var notificationTitle: String?
     var deviceSet: String?
     var silent: Bool?
+    var releaseNotes: [String]?
 }
 
 struct ShelfCatalog: Codable {
@@ -284,9 +285,15 @@ func deliverDirect(directory: String) throws {
     let build = try ShelfDeliveryState.reserve(bundle: metadata.bundleIdentifier, commit: commit, minimum: minimum, directory: TestFlightConfiguration.directory).build
     let package = try packageDirect(directory: directory, build: build)
     let previousApplication = previous.applications.first(where: { $0.bundleIdentifier == metadata.bundleIdentifier })
+    let releaseNotes: [String]?
+    if previousApplication?.sourceCommit == commit {
+        releaseNotes = previousApplication?.releaseNotes
+    } else {
+        releaseNotes = try shelfReleaseNotes(github: store.github, name: metadata.name, previous: previousApplication?.sourceCommit, commit: commit)
+    }
     let resignedForDevices = previousApplication.map { $0.sourceCommit == commit && !devices.isCurrent($0) } ?? false
     let application = try publishShelfArtifact(store: store, tag: "\(metadata.name)-\(build)-\(commit.prefix(12))", title: "\(metadata.name) \(package.version) (\(build))", intent: ["sourceCommit": commit, "bundleIdentifier": metadata.bundleIdentifier, "build": build], package: URL(fileURLWithPath: package.path), assetName: "\(metadata.name).ipa", size: package.size, sha256: package.sha256) { asset in
-        ShelfApplication(name: package.name, bundleIdentifier: package.bundleIdentifier, version: package.version, build: package.build, minimumOSVersion: package.minimumOSVersion, profileExpiration: package.profileExpiration, sourceCommit: commit, sha256: package.sha256, size: package.size, packageAssetID: asset.id, publishedAt: Date(), manifestAssetID: nil, installExpiration: nil, iconPNG: try shelfIcon(root: root, name: metadata.name), notificationTitle: previousApplication == nil ? "New app available" : "Update available", deviceSet: package.devices, silent: resignedForDevices)
+        ShelfApplication(name: package.name, bundleIdentifier: package.bundleIdentifier, version: package.version, build: package.build, minimumOSVersion: package.minimumOSVersion, profileExpiration: package.profileExpiration, sourceCommit: commit, sha256: package.sha256, size: package.size, packageAssetID: asset.id, publishedAt: Date(), manifestAssetID: nil, installExpiration: nil, iconPNG: try shelfIcon(root: root, name: metadata.name), notificationTitle: previousApplication == nil ? "New app available" : "Update available", deviceSet: package.devices, silent: resignedForDevices, releaseNotes: releaseNotes)
     }
     try withShelfLock {
         let (release, latest) = try store.catalog()
@@ -382,4 +389,35 @@ func shelfIcon(root: URL, name: String) throws -> String? {
     CGImageDestinationAddImage(destination, image, nil)
     guard CGImageDestinationFinalize(destination) else { throw CommandError(message: "Cannot encode the shelf icon.") }
     return (data as Data).base64EncodedString()
+}
+
+func shelfReleaseNotes(github: PersonalGitHub, name: String, previous: String?, commit: String) throws -> [String] {
+    struct Commit: Decodable {
+        struct Details: Decodable {
+            let message: String
+        }
+        let commit: Details
+        let parents: [Parent]
+        struct Parent: Decodable {
+            let sha: String
+        }
+    }
+    struct Comparison: Decodable {
+        let status: String
+        let commits: [Commit]
+    }
+    let commits: [Commit]
+    if let previous {
+        let output = try github.call(["api", "--paginate", "--slurp", "repos/lucaswkuipers/\(name)/compare/\(previous)...\(commit)?per_page=100"])
+        let pages = try JSONDecoder().decode([Comparison].self, from: Data(output.utf8))
+        guard pages.allSatisfy({ $0.status == "ahead" || $0.status == "identical" }) else {
+            throw CommandError(message: "Cannot generate release notes: the published commit is not an ancestor of this build.")
+        }
+        commits = pages.flatMap(\.commits).reversed()
+    } else {
+        let output = try github.call(["api", "repos/lucaswkuipers/\(name)/commits?sha=\(commit)&per_page=6"])
+        commits = try JSONDecoder().decode([Commit].self, from: Data(output.utf8))
+    }
+    return commits.filter { $0.parents.count < 2 }.compactMap { $0.commit.message.split(separator: "\n").first.map(String.init) }
+        .filter { !$0.lowercased().contains("[skip ci]") }
 }

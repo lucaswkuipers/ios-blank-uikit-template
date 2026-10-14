@@ -311,7 +311,7 @@ func resignShelfPackage(_ current: ShelfApplication, name: String, store: ShelfS
     let sha256 = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     let intent = ["sourceCommit": current.sourceCommit, "bundleIdentifier": current.bundleIdentifier, "build": current.build, "deviceSet": devices.identifier]
     let application = try publishShelfArtifact(store: store, tag: "\(name)-\(current.build)-\(current.sourceCommit.prefix(12))-\(devices.identifier)", title: "\(name) \(current.version) (\(current.build))", intent: intent, package: package, assetName: "\(name).ipa", size: data.count, sha256: sha256) { asset in
-        ShelfApplication(name: current.name, bundleIdentifier: current.bundleIdentifier, version: current.version, build: current.build, minimumOSVersion: current.minimumOSVersion, profileExpiration: expiration, sourceCommit: current.sourceCommit, sha256: sha256, size: data.count, packageAssetID: asset.id, publishedAt: current.publishedAt, manifestAssetID: nil, installExpiration: nil, iconPNG: current.iconPNG, notificationTitle: current.notificationTitle, deviceSet: devices.identifier, silent: true)
+        ShelfApplication(name: current.name, bundleIdentifier: current.bundleIdentifier, version: current.version, build: current.build, minimumOSVersion: current.minimumOSVersion, profileExpiration: expiration, sourceCommit: current.sourceCommit, sha256: sha256, size: data.count, packageAssetID: asset.id, publishedAt: current.publishedAt, manifestAssetID: nil, installExpiration: nil, iconPNG: current.iconPNG, notificationTitle: current.notificationTitle, deviceSet: devices.identifier, silent: true, releaseNotes: current.releaseNotes)
     }
     try withShelfLock {
         let (release, latest) = try store.catalog()
