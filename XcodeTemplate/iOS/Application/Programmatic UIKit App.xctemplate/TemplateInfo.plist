@@ -109,6 +109,8 @@
 				<string>Automatic</string>
 				<key>INFOPLIST_FILE</key>
 				<string>___PACKAGENAME___/Info.plist</string>
+				<key>IPHONEOS_DEPLOYMENT_TARGET</key>
+				<string>26.6.1</string>
 				<key>LD_RUNPATH_SEARCH_PATHS</key>
 				<string>$(inherited) @executable_path/Frameworks</string>
 				<key>SUPPORTED_PLATFORMS</key>

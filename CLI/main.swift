@@ -33,7 +33,7 @@ func create(name: String, options: Options) throws {
     guard let bundleIdentifier = options.values["--bundle-id"] ?? configuration["bundlePrefix"].map({ "\($0).\(name)" }) else {
         throw CommandError(message: "Provide --bundle-id or set bundlePrefix in \(configurationURL.path)")
     }
-    let deploymentTarget = try options.values["--deployment-target"] ?? run("/usr/bin/xcrun", ["--sdk", "iphoneos", "--show-sdk-version"], log: nil)
+    let deploymentTarget = options.values["--deployment-target"] ?? "26.6.1"
     guard let delivery = DeliveryRoute(rawValue: options.values["--delivery"] ?? configuration["delivery"] ?? "testflight") else {
         throw CommandError(message: "Delivery must be shelf or testflight.")
     }
