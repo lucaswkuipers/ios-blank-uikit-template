@@ -95,6 +95,15 @@ do {
     }
     let smallCatalog = ShelfCatalog(schema: 1, applications: [catalogApps[0]], invitation: nil)
     try expect(try shelfCatalogData(smallCatalog, encoder: JSONEncoder()) == JSONEncoder().encode(smallCatalog), "Catalogs below the budget retain their original thumbnails")
+    try expect(!String(decoding: try JSONEncoder().encode(smallCatalog), as: UTF8.self).contains("visionApplications"), "Catalogs without visionOS apps keep their existing shape")
+    var platformCatalog = smallCatalog
+    var visionApp = catalogApps[1]
+    visionApp.platform = ShelfPlatform.visionOS.catalogValue
+    platformCatalog.setApplications([visionApp], for: .visionOS)
+    let decodedPlatforms = try JSONDecoder().decode(ShelfCatalog.self, from: JSONEncoder().encode(platformCatalog))
+    try expect(decodedPlatforms.applications(for: .iOS).map(\.bundleIdentifier) == [catalogApps[0].bundleIdentifier] && decodedPlatforms.applications(for: .visionOS).map(\.platform) == ["visionOS"], "visionOS apps stay out of the list older iPhone clients read")
+    let visionProject = try JSONDecoder().decode(Project.self, from: Data(#"{"name":"Blockport","bundleIdentifier":"com.lucaswkuipers.blockport.vision","product":"Blockport Vision","platforms":["visionOS"],"publishOnRequest":true}"#.utf8))
+    try expect(visionProject.productName == "Blockport Vision" && visionProject.shelfPlatforms == [.visionOS] && ShelfPlatform.visionOS.destination == "generic/platform=visionOS", "Projects choose their product and shelf platforms")
 
     let personal: [String: Any] = ["DEVELOPMENT_TEAM": "AR7T5G5Z83", "PRODUCT_BUNDLE_IDENTIFIER": "com.lucaswkuipers.Test", "CODE_SIGN_STYLE": "Automatic"]
     let legacyProject = try JSONDecoder().decode(Project.self, from: Data(#"{"name":"Test","bundleIdentifier":"com.lucaswkuipers.Test"}"#.utf8))

@@ -215,11 +215,12 @@ func directProfileVariable(_ bundle: String) throws -> String {
     return "SHELF_PROFILE_" + bundle.replacingOccurrences(of: ".", with: "_").replacingOccurrences(of: "-", with: "_")
 }
 
-func packageDirect(directory: String, build: String) throws -> DirectPackage {
+func packageDirect(directory: String, build: String, platform: ShelfPlatform = .iOS, metadataPath: String = Project.defaultPath) throws -> DirectPackage {
     _ = try nextBuildNumber(build)
     let root = URL(fileURLWithPath: directory).standardizedFileURL.resolvingSymlinksInPath()
-    let metadata = try JSONDecoder().decode(Project.self, from: Data(contentsOf: root.appendingPathComponent(".uikit-app.json")))
+    let metadata = try Project.load(root: root, path: metadataPath)
     try validate(metadata.name, pattern: "^[A-Za-z][A-Za-z0-9]*$", label: "project name")
+    try validate(metadata.productName, pattern: "^[A-Za-z][A-Za-z0-9 ]*$", label: "product name")
     guard metadata.bundleIdentifier.hasPrefix(TestFlightConfiguration.bundlePrefix) else {
         throw CommandError(message: "Direct distribution is restricted to personal apps.")
     }
@@ -239,7 +240,7 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
         }
     }
     let fingerprint = try sourceFingerprint(root)
-    let cache = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/Direct/\(metadata.name)/\(configuration.certificateID)-\(devices.identifier)/\(fingerprint.prefix(16))-\(build)")
+    let cache = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/Direct/\(metadata.name)/\(configuration.certificateID)-\(devices.identifier)/\(fingerprint.prefix(16))-\(build)\(platform == .iOS ? "" : "-\(platform.rawValue)")")
     try files.createDirectory(at: cache, withIntermediateDirectories: true)
     let descriptor = open(cache.appendingPathComponent("package.lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
     guard descriptor >= 0 else { throw CommandError(message: "Cannot open package lock.") }
@@ -258,7 +259,7 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
     }
     let scheme = metadata.scheme ?? metadata.name
     let projectArguments = ["-project", project.path, "-scheme", scheme, "-configuration", "Release"]
-    let settingsJSON = try run("/usr/bin/xcodebuild", projectArguments + ["-destination", "generic/platform=iOS", "-showBuildSettings", "-json"], log: nil, separateError: true)
+    let settingsJSON = try run("/usr/bin/xcodebuild", projectArguments + ["-destination", platform.destination, "-showBuildSettings", "-json"], log: nil, separateError: true)
     guard let targets = try JSONSerialization.jsonObject(with: Data(settingsJSON.utf8)) as? [[String: Any]] else {
         throw CommandError(message: "Cannot read the app's build settings.")
     }
@@ -318,8 +319,8 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
     }
     let archive = cache.appendingPathComponent("Direct.xcarchive")
     if files.fileExists(atPath: archive.path) { try files.removeItem(at: archive) }
-    status("Archiving \(metadata.name) build \(build) for \(devices.udids.count) shelf iPhones…")
-    try run("/usr/bin/xcodebuild", projectArguments + ["-destination", "generic/platform=iOS", "-derivedDataPath", files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/Direct/\(metadata.name)/DerivedData").path, "-archivePath", archive.path, "-quiet", "archive", "CURRENT_PROJECT_VERSION=\(build)", "DEVELOPMENT_TEAM=\(TestFlightConfiguration.personalTeam)", "CODE_SIGN_STYLE=Manual", "CODE_SIGN_IDENTITY=\(configuration.certificateSHA1)"] + signingArguments, log: cache.appendingPathComponent("archive.log"))
+    status("Archiving \(metadata.name) build \(build) for \(platform.rawValue) on \(devices.udids.count) shelf devices…")
+    try run("/usr/bin/xcodebuild", projectArguments + ["-destination", platform.destination, "-derivedDataPath", files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/Direct/\(metadata.name)/DerivedData").path, "-archivePath", archive.path, "-quiet", "archive", "CURRENT_PROJECT_VERSION=\(build)", "DEVELOPMENT_TEAM=\(TestFlightConfiguration.personalTeam)", "CODE_SIGN_STYLE=Manual", "CODE_SIGN_IDENTITY=\(configuration.certificateSHA1)"] + signingArguments, log: cache.appendingPathComponent("archive.log"))
     guard try sourceFingerprint(root) == fingerprint else {
         throw CommandError(message: "Sources changed during the archive. Finish edits and rerun; no package was published.")
     }
@@ -329,12 +330,12 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
     let optionsFile = cache.appendingPathComponent("ExportOptions.plist")
     try PropertyListSerialization.data(fromPropertyList: options, format: .xml, options: 0).write(to: optionsFile, options: .atomic)
     try run("/usr/bin/xcodebuild", ["-exportArchive", "-archivePath", archive.path, "-exportOptionsPlist", optionsFile.path, "-exportPath", export.path], log: cache.appendingPathComponent("export.log"))
-    let package = export.appendingPathComponent("\(metadata.name).ipa")
+    let package = export.appendingPathComponent("\(metadata.productName).ipa")
     let unpacked = cache.appendingPathComponent("Verified")
     if files.fileExists(atPath: unpacked.path) { try files.removeItem(at: unpacked) }
     try run("/usr/bin/ditto", ["-x", "-k", package.path, unpacked.path], log: nil)
     defer { try? files.removeItem(at: unpacked) }
-    let application = unpacked.appendingPathComponent("Payload/\(metadata.name).app")
+    let application = unpacked.appendingPathComponent("Payload/\(metadata.productName).app")
     try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", application.path], log: nil)
     let signature = try run("/usr/bin/codesign", ["-dvv", application.path], log: nil)
     guard signature.split(separator: "\n").contains("TeamIdentifier=\(TestFlightConfiguration.personalTeam)") else {
@@ -346,7 +347,8 @@ func packageDirect(directory: String, build: String) throws -> DirectPackage {
           information["CFBundleIdentifier"] as? String == metadata.bundleIdentifier,
           information["CFBundleVersion"] as? String == build,
           let version = information["CFBundleShortVersionString"] as? String,
-          let minimumOSVersion = information["MinimumOSVersion"] as? String else {
+          let minimumOSVersion = information["MinimumOSVersion"] as? String,
+          information["DTPlatformName"] as? String == (platform == .iOS ? "iphoneos" : "xros") else {
         throw CommandError(message: "Exported package identity or version does not match the requested app.")
     }
     if let cloudEnvironment {

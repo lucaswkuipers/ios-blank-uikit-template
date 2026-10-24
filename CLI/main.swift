@@ -182,7 +182,7 @@ do {
         uikit-app login
         uikit-app setup-direct --device <iPhone-UDID> --name <device-name>
         uikit-app package <project-directory> --build <number>
-        uikit-app direct <project-directory>
+        uikit-app direct <project-directory> [--metadata <path-in-repository>]
         uikit-app refresh-shelf
         uikit-app setup-shelf-refresh
         uikit-app setup-shelf-installs
@@ -239,8 +239,8 @@ do {
         case "testflight":
             try deliverTestFlight(directory: arguments[1], options: Options(arguments.dropFirst(2), allowed: ["--wait-seconds", "--retry-upload"]))
         case "direct":
-            _ = try Options(arguments.dropFirst(2), allowed: [])
-            try deliverDirect(directory: arguments[1])
+            let options = try Options(arguments.dropFirst(2), allowed: ["--metadata"])
+            try deliverDirect(directory: arguments[1], metadataPath: options.values["--metadata"] ?? Project.defaultPath)
         case "setup-repo":
             _ = try Options(arguments.dropFirst(2), allowed: [])
             let github = try setupAppRepository(directory: arguments[1], template: repository)

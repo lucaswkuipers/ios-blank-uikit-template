@@ -20,12 +20,23 @@ struct ShelfApplication: Codable {
     var deviceSet: String?
     var silent: Bool?
     var releaseNotes: [String]?
+    var platform: String?
 }
 
 struct ShelfCatalog: Codable {
     let schema: Int
     var applications: [ShelfApplication]
     var invitation: String?
+    // Older AppShelf clients ignore this list, so visionOS apps never appear on iPhones.
+    var visionApplications: [ShelfApplication]?
+
+    func applications(for platform: ShelfPlatform) -> [ShelfApplication] {
+        platform == .iOS ? applications : visionApplications ?? []
+    }
+
+    mutating func setApplications(_ list: [ShelfApplication], for platform: ShelfPlatform) {
+        if platform == .iOS { applications = list } else { visionApplications = list }
+    }
 }
 
 func shelfCatalogData(_ value: ShelfCatalog, encoder: JSONEncoder) throws -> Data {
@@ -281,9 +292,9 @@ func installLaunchAgent(identifier: String, command: String, interval: Int, log:
     }
 }
 
-func deliverDirect(directory: String) throws {
+func deliverDirect(directory: String, metadataPath: String = Project.defaultPath) throws {
     let root = URL(fileURLWithPath: directory).standardizedFileURL.resolvingSymlinksInPath()
-    let metadata = try JSONDecoder().decode(Project.self, from: Data(contentsOf: root.appendingPathComponent(".uikit-app.json")))
+    let metadata = try Project.load(root: root, path: metadataPath)
     try validate(metadata.bundleIdentifier, pattern: "^com\\.lucaswkuipers\\.[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)*$", label: "personal bundle identifier")
     let lockDirectory = TestFlightConfiguration.directory.appendingPathComponent("locks")
     try files.createDirectory(at: lockDirectory, withIntermediateDirectories: true)
@@ -304,25 +315,31 @@ func deliverDirect(directory: String) throws {
     guard try store.github.git(root, ["status", "--porcelain"], remote: false).isEmpty else {
         throw CommandError(message: "Commit app changes before direct delivery.")
     }
+    for platform in metadata.shelfPlatforms {
+        try deliverDirect(root: root, metadata: metadata, metadataPath: metadataPath, platform: platform, store: store, devices: devices)
+    }
+}
+
+func deliverDirect(root: URL, metadata: Project, metadataPath: String, platform: ShelfPlatform, store: ShelfStore, devices: ShelfDevices) throws {
     let commit = try store.github.git(root, ["rev-parse", "HEAD"], remote: false)
     let (_, previous) = try store.catalog()
-    if let application = previous.applications.first(where: { $0.bundleIdentifier == metadata.bundleIdentifier && $0.sourceCommit == commit }), application.profileExpiration > Date().addingTimeInterval(86400), devices.isCurrent(application) {
+    let previousApplication = previous.applications(for: platform).first(where: { $0.bundleIdentifier == metadata.bundleIdentifier })
+    if let application = previousApplication, application.sourceCommit == commit, application.profileExpiration > Date().addingTimeInterval(86400), devices.isCurrent(application) {
         _ = try withShelfLock { try store.refresh() }
-        try emit(["result": "available-in-shelf", "app": metadata.name, "build": application.build, "team": TestFlightConfiguration.personalTeam, "sourcesChanged": "false"])
+        try emit(["result": "available-in-shelf", "app": metadata.name, "platform": platform.rawValue, "build": application.build, "team": TestFlightConfiguration.personalTeam, "sourcesChanged": "false"])
         return
     }
-    let previousBuild = previous.applications.first(where: { $0.bundleIdentifier == metadata.bundleIdentifier })?.build
     let client = try AppStoreClient(configuration: TestFlightConfiguration.load())
     try client.verifyPersonalAccount()
     let apps = try client.list("/v1/apps", query: ["filter[bundleId]": metadata.bundleIdentifier])
-    var minimum = try nextBuildNumber(previousBuild)
+    var minimum = try nextBuildNumber(previousApplication?.build)
     if let app = apps.first {
         let flight = try nextAppleBuildNumber(appID: app.id, client: client)
         if flight.compare(minimum, options: .numeric) == .orderedDescending { minimum = flight }
     }
+    // Platforms of one commit share its reserved build number.
     let build = try ShelfDeliveryState.reserve(bundle: metadata.bundleIdentifier, commit: commit, minimum: minimum, directory: TestFlightConfiguration.directory).build
-    let package = try packageDirect(directory: directory, build: build)
-    let previousApplication = previous.applications.first(where: { $0.bundleIdentifier == metadata.bundleIdentifier })
+    let package = try packageDirect(directory: root.path, build: build, platform: platform, metadataPath: metadataPath)
     let releaseNotes: [String]?
     if previousApplication?.sourceCommit == commit {
         releaseNotes = previousApplication?.releaseNotes
@@ -330,27 +347,38 @@ func deliverDirect(directory: String) throws {
         releaseNotes = try shelfReleaseNotes(github: store.github, name: metadata.name, previous: previousApplication?.sourceCommit, commit: commit)
     }
     let resignedForDevices = previousApplication.map { $0.sourceCommit == commit && !devices.isCurrent($0) } ?? false
-    let application = try publishShelfArtifact(store: store, tag: "\(metadata.name)-\(build)-\(commit.prefix(12))", title: "\(metadata.name) \(package.version) (\(build))", intent: ["sourceCommit": commit, "bundleIdentifier": metadata.bundleIdentifier, "build": build], package: URL(fileURLWithPath: package.path), assetName: "\(metadata.name).ipa", size: package.size, sha256: package.sha256) { asset in
-        ShelfApplication(name: package.name, bundleIdentifier: package.bundleIdentifier, version: package.version, build: package.build, minimumOSVersion: package.minimumOSVersion, profileExpiration: package.profileExpiration, sourceCommit: commit, sha256: package.sha256, size: package.size, packageAssetID: asset.id, publishedAt: Date(), manifestAssetID: nil, installExpiration: nil, iconPNG: try shelfIcon(root: root, name: metadata.name), notificationTitle: previousApplication == nil ? "New app available" : "Update available", deviceSet: package.devices, silent: resignedForDevices, releaseNotes: releaseNotes)
+    let suffix = platform == .iOS ? "" : "-\(platform.rawValue)"
+    let application = try publishShelfArtifact(store: store, tag: "\(metadata.name)\(suffix)-\(build)-\(commit.prefix(12))", title: "\(metadata.name) \(package.version) (\(build))\(platform == .iOS ? "" : " for \(platform.rawValue)")", intent: ["sourceCommit": commit, "bundleIdentifier": metadata.bundleIdentifier, "build": build].merging(platform.catalogValue.map { ["platform": $0] } ?? [:]) { $1 }, package: URL(fileURLWithPath: package.path), assetName: "\(metadata.name).ipa", size: package.size, sha256: package.sha256) { asset in
+        ShelfApplication(name: package.name, bundleIdentifier: package.bundleIdentifier, version: package.version, build: package.build, minimumOSVersion: package.minimumOSVersion, profileExpiration: package.profileExpiration, sourceCommit: commit, sha256: package.sha256, size: package.size, packageAssetID: asset.id, publishedAt: Date(), manifestAssetID: nil, installExpiration: nil, iconPNG: try shelfIcon(root: root, metadata: metadata), notificationTitle: previousApplication == nil ? "New app available" : "Update available", deviceSet: package.devices, silent: resignedForDevices, releaseNotes: releaseNotes, platform: platform.catalogValue)
     }
     try withShelfLock {
         let (release, latest) = try store.catalog()
         var updated = latest
-        if let current = latest.applications.first(where: { $0.bundleIdentifier == application.bundleIdentifier }), current.build.compare(build, options: .numeric) == .orderedDescending {
+        var list = latest.applications(for: platform)
+        let cataloged = list.first(where: { $0.bundleIdentifier == application.bundleIdentifier })
+        if let cataloged, cataloged.build.compare(build, options: .numeric) == .orderedDescending {
             throw CommandError(message: "A newer build is already available in the shelf. It was preserved.")
         }
         let currentMain = try store.github.call(["api", "repos/lucaswkuipers/\(metadata.name)/git/ref/heads/main", "--jq", ".object.sha"])
-        let resigningCatalogedCommit = latest.applications.first(where: { $0.bundleIdentifier == application.bundleIdentifier })?.sourceCommit == commit
-        guard currentMain == commit || resigningCatalogedCommit else {
+        let resigningCatalogedCommit = cataloged?.sourceCommit == commit
+        // Apps published on request build whichever main commit they started from, as main may move during a long build.
+        let onRequest = try metadata.publishOnRequest == true && shelfCommit(commit, isAncestorOf: currentMain, name: metadata.name, github: store.github)
+        guard currentMain == commit || resigningCatalogedCommit || onRequest else {
             throw CommandError(message: "Main has a newer commit. This build was retained in release history without replacing the current shelf app.")
         }
-        updated.applications.removeAll { $0.bundleIdentifier == application.bundleIdentifier }
-        updated.applications.append(application)
-        updated.applications.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        list.removeAll { $0.bundleIdentifier == application.bundleIdentifier }
+        list.append(application)
+        list.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        updated.setApplications(list, for: platform)
         try store.updateBody(updated, releaseID: release.id)
         _ = try store.refresh()
     }
-    try emit(["result": "available-in-shelf", "app": metadata.name, "build": build, "team": TestFlightConfiguration.personalTeam, "sourcesChanged": String(try sourceFingerprint(root) != package.fingerprint)])
+    try emit(["result": "available-in-shelf", "app": metadata.name, "platform": platform.rawValue, "build": build, "team": TestFlightConfiguration.personalTeam, "sourcesChanged": String(try sourceFingerprint(root) != package.fingerprint)])
+}
+
+func shelfCommit(_ commit: String, isAncestorOf head: String, name: String, github: PersonalGitHub) throws -> Bool {
+    let status = try github.call(["api", "repos/lucaswkuipers/\(name)/compare/\(commit)...\(head)", "--jq", ".status"])
+    return status == "ahead" || status == "identical"
 }
 
 func publishShelfArtifact(store: ShelfStore, tag: String, title: String, intent: [String: String], package: URL, assetName: String, size: Int, sha256: String, describe: (ShelfAsset) throws -> ShelfApplication) throws -> ShelfApplication {
@@ -402,18 +430,29 @@ func publishShelfArtifact(store: ShelfStore, tag: String, title: String, intent:
     return application
 }
 
-func shelfIcon(root: URL, name: String) throws -> String? {
-    let directory = root.appendingPathComponent("\(name)/Assets.xcassets/AppIcon.appiconset")
-    let contents = directory.appendingPathComponent("Contents.json")
-    guard files.fileExists(atPath: contents.path) else { return nil }
-    struct Contents: Decodable {
-        struct Image: Decodable { let filename: String? }
-        let images: [Image]
+func shelfIcon(root: URL, metadata: Project) throws -> String? {
+    let image: URL
+    if let path = metadata.iconImage {
+        image = root.appendingPathComponent(path).standardizedFileURL.resolvingSymlinksInPath()
+        guard image.path.hasPrefix(root.path + "/") else {
+            throw CommandError(message: "The shelf icon must be inside the app repository.")
+        }
+    } else {
+        let directory = root.appendingPathComponent("\(metadata.name)/Assets.xcassets/AppIcon.appiconset")
+        let contents = directory.appendingPathComponent("Contents.json")
+        guard files.fileExists(atPath: contents.path) else { return nil }
+        struct Contents: Decodable {
+            struct Image: Decodable { let filename: String? }
+            let images: [Image]
+        }
+        let catalog = try JSONDecoder().decode(Contents.self, from: Data(contentsOf: contents))
+        guard let filename = catalog.images.compactMap(\.filename).first,
+              !filename.contains("/"), !filename.contains("..") else {
+            throw CommandError(message: "Cannot read the app icon for the shelf.")
+        }
+        image = directory.appendingPathComponent(filename)
     }
-    let catalog = try JSONDecoder().decode(Contents.self, from: Data(contentsOf: contents))
-    guard let filename = catalog.images.compactMap(\.filename).first,
-          !filename.contains("/"), !filename.contains(".."),
-          let source = CGImageSourceCreateWithURL(directory.appendingPathComponent(filename) as CFURL, nil),
+    guard let source = CGImageSourceCreateWithURL(image as CFURL, nil),
           let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceThumbnailMaxPixelSize: 128
@@ -456,6 +495,7 @@ func shelfReleaseNotes(github: PersonalGitHub, name: String, previous: String?, 
         let output = try github.call(["api", "repos/lucaswkuipers/\(name)/commits?sha=\(commit)&per_page=6"])
         commits = try JSONDecoder().decode([Commit].self, from: Data(output.utf8))
     }
-    return commits.filter { $0.parents.count < 2 }.compactMap { $0.commit.message.split(separator: "\n").first.map(String.init) }
-        .filter { !$0.lowercased().contains("[skip ci]") }
+    // The catalog carries these notes, so busy repositories keep only the latest ones.
+    return Array(commits.filter { $0.parents.count < 2 }.compactMap { $0.commit.message.split(separator: "\n").first.map(String.init) }
+        .filter { !$0.lowercased().contains("[skip ci]") }.prefix(30))
 }

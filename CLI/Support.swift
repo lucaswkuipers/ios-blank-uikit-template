@@ -10,8 +10,33 @@ struct Project: Codable {
     let xcodeProject: String?
     let scheme: String?
     let prepareScript: String?
+    var product: String? = nil
+    var platforms: [ShelfPlatform]? = nil
+    var iconImage: String? = nil
+    var publishOnRequest: Bool? = nil
+
+    static let defaultPath = ".uikit-app.json"
+
+    /// Loads delivery metadata; a repository with several apps names each one's file inside it.
+    static func load(root: URL, path: String = defaultPath) throws -> Self {
+        let file = root.appendingPathComponent(path).standardizedFileURL.resolvingSymlinksInPath()
+        guard file.path.hasPrefix(root.path + "/"), file.pathExtension == "json" else {
+            throw CommandError(message: "App metadata must be a JSON file inside the app repository.")
+        }
+        return try JSONDecoder().decode(Self.self, from: Data(contentsOf: file))
+    }
 
     var route: DeliveryRoute { delivery ?? .testflight }
+    var productName: String { product ?? name }
+    var shelfPlatforms: [ShelfPlatform] { platforms ?? [.iOS] }
+}
+
+enum ShelfPlatform: String, Codable {
+    case iOS
+    case visionOS
+
+    var destination: String { "generic/platform=\(rawValue)" }
+    var catalogValue: String? { self == .iOS ? nil : rawValue }
 }
 
 enum DeliveryRoute: String, Codable {
