@@ -206,6 +206,10 @@ struct ShelfStore {
 
     func refresh() throws -> ShelfCatalog {
         let (release, previous) = try catalog()
+        // Pruning before uploading keeps a full release from blocking its own cleanup.
+        for asset in staleShelfManifests(release.assets, active: Set(previous.applications.compactMap(\.manifestAssetID))) {
+            try github.call(["api", "--method", "DELETE", "repos/\(Self.repository)/releases/assets/\(asset.id)"])
+        }
         var updated = previous
         var changed = false
         for index in updated.applications.indices {
@@ -232,13 +236,18 @@ struct ShelfStore {
         }
         if changed { try updateBody(updated, releaseID: release.id) }
         try publishShelfNotifications(updated)
-        let activeIDs = Set(updated.applications.compactMap(\.manifestAssetID))
-        for asset in release.assets where !activeIDs.contains(asset.id) {
-            guard let created = ISO8601DateFormatter().date(from: asset.created_at), created < Date().addingTimeInterval(-7200) else { continue }
-            try github.call(["api", "--method", "DELETE", "repos/\(Self.repository)/releases/assets/\(asset.id)"])
-        }
         return updated
     }
+}
+
+// Legacy manifests embed GitHub package links that expire within minutes, so superseded ones are dead soon after
+// upload. The count cap keeps GitHub's 1,000-asset release limit out of reach however many apps the shelf holds.
+func staleShelfManifests(_ assets: [ShelfAsset], active: Set<Int>, now: Date = Date()) -> [ShelfAsset] {
+    let formatter = ISO8601DateFormatter()
+    let superseded = assets.filter { !active.contains($0.id) }.sorted { $0.created_at > $1.created_at }
+    return superseded.enumerated().filter { index, asset in
+        index >= 300 || formatter.date(from: asset.created_at).map { $0 < now.addingTimeInterval(-900) } == true
+    }.map(\.element)
 }
 
 func withShelfLock<T>(_ operation: () throws -> T) throws -> T {

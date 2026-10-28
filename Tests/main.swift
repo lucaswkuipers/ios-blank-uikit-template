@@ -90,6 +90,15 @@ do {
     let compactCatalog = try JSONDecoder().decode(ShelfCatalog.self, from: compactCatalogData)
     try expect(compactCatalogData.count <= 100_000, "Catalog thumbnails must leave headroom below GitHub's release body limit")
     try expect(compactCatalog.applications.map(\.manifestAssetID) == catalogApps.map(\.manifestAssetID) && compactCatalog.invitation == oversizedCatalog.invitation, "Compacting icons preserves installation links and the invitation")
+    let pruneTime = Date()
+    let manifests = (0..<1000).map { index in
+        ShelfAsset(id: index, name: "manifest-\(index).plist", created_at: ISO8601DateFormatter().string(from: pruneTime.addingTimeInterval(-Double(index) * 2)), size: 1, digest: nil)
+    }
+    let pruned = Set(staleShelfManifests(manifests, active: [999, 5], now: pruneTime).map(\.id))
+    try expect(!pruned.contains(999) && !pruned.contains(5), "Pruning keeps manifests the catalog still links")
+    try expect(!pruned.contains(0) && !pruned.contains(299) && pruned.contains(301) && pruned.contains(998), "Pruning keeps recent manifests and removes old superseded ones")
+    try expect(manifests.count - pruned.count <= 302, "Pruning leaves room below GitHub's asset limit")
+    try expect(staleShelfManifests(Array(manifests.prefix(50)), active: [], now: pruneTime).isEmpty, "Recent superseded manifests stay for clients mid-install")
     for app in compactCatalog.applications {
         try expect(CGImageSourceCreateWithData(Data(base64Encoded: app.iconPNG!)! as CFData, nil) != nil, "Compacted icons remain decodable images")
     }
