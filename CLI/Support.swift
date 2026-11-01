@@ -14,6 +14,7 @@ struct Project: Codable {
     var platforms: [ShelfPlatform]? = nil
     var iconImage: String? = nil
     var publishOnRequest: Bool? = nil
+    var ownerOnly: Bool? = nil
 
     static let defaultPath = ".uikit-app.json"
 

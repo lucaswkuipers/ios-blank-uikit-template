@@ -225,7 +225,7 @@ func packageDirect(directory: String, build: String, platform: ShelfPlatform = .
         throw CommandError(message: "Direct distribution is restricted to personal apps.")
     }
     let configuration = try DirectConfiguration.load()
-    let devices = ShelfDevices(configuration: configuration, sharing: try ShelfSharing.load())
+    let devices = try ShelfDevices.load(for: metadata)
     let client = try AppStoreClient(configuration: TestFlightConfiguration.load())
     try client.verifyPersonalAccount()
     if let path = metadata.prepareScript {

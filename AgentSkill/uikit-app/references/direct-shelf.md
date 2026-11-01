@@ -49,6 +49,10 @@ The invite is the current AppShelf IPA and its manifest in a secret gist under `
 
 Rerun `share-shelf` without options to retry and reprint the invite. `share-shelf --remove <device-name-or-UDID>` revokes an iPhone: everything, including the invite's AppShelf, is re-signed without it, so it can no longer install or update anything. Apps already on that iPhone keep running until their profiles expire (Ad Hoc has no per-device kill switch), and its AppShelf can still read the catalog until the artifact token is rotated. The iPhone stays registered with Apple; never disable it automatically. Do not claim a shared install worked until that person confirms it.
 
+## Owner-only apps
+
+`"ownerOnly": true` in an iOS app's `.uikit-app.json` keeps it from everyone the shelf is shared with: it is signed for the configured iPhone alone and goes in the catalog's `ownerApplications` list, which only the owner's AppShelf shows and older clients ignore. It sends no announcements and is skipped by `share-shelf`. Mac-assisted installs still include it. Removing the field moves the app back to the shared list on its next delivery.
+
 ## Access requests
 
 `uikit-app setup-shelf-requests` deploys `CLI/ShelfRequests/worker.js` as the `appshelf` Cloudflare Worker on the owner's free account (the only account in `wrangler whoami`, pinned as `account_id`), with a free D1 database (`appshelf-requests`, schema in `CLI/ShelfRequests/schema.sql`). Wrangler 4.143.0 runs with the CLI's own npm cache and a minimal environment, so agent variables never switch it into non-interactive account changes; the first login is a browser sign-in using the command setup prints. Each deploy passes the admin token with `--secrets-file`, and the worker rejects admin calls when the token is missing or short. `~/.config/uikit-app/shelf-requests.json` keeps the worker URL and token; neither belongs in Git. Setup writes the worker URL to the catalog's `invitation` field, the base of the personal invite links AppShelf creates. The bare URL still works as a generic request link.

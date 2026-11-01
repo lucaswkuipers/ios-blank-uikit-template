@@ -140,11 +140,12 @@ func installShelfApplications(_ catalog: ShelfCatalog, store: ShelfStore) {
         var installed = try shelfInstalledApps(deviceUDID: configuration.deviceUDID)
         let cache = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/ShelfInstalls")
         try files.createDirectory(at: cache, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let activePackages = Set(catalog.applications.map { "\($0.sha256).ipa" })
+        let installable = catalog.applications + (catalog.ownerApplications ?? [])
+        let activePackages = Set(installable.map { "\($0.sha256).ipa" })
         for path in try files.contentsOfDirectory(at: cache, includingPropertiesForKeys: nil) where path.pathExtension == "ipa" && !activePackages.contains(path.lastPathComponent) {
             try files.removeItem(at: path)
         }
-        for application in catalog.applications {
+        for application in installable {
             do {
                 try validate(application.bundleIdentifier, pattern: "^com\\.lucaswkuipers\\.[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)*$", label: "personal bundle identifier")
                 try validate(application.sha256, pattern: "^[0-9a-f]{64}$", label: "package checksum")

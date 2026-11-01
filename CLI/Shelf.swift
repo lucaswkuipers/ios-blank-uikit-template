@@ -29,6 +29,8 @@ struct ShelfCatalog: Codable {
     var invitation: String?
     // Older AppShelf clients ignore this list, so visionOS apps never appear on iPhones.
     var visionApplications: [ShelfApplication]?
+    // Only the owner's AppShelf lists these. Older clients, announcements and device re-signing never read this list.
+    var ownerApplications: [ShelfApplication]?
 
     func applications(for platform: ShelfPlatform) -> [ShelfApplication] {
         platform == .iOS ? applications : visionApplications ?? []
@@ -36,6 +38,21 @@ struct ShelfCatalog: Codable {
 
     mutating func setApplications(_ list: [ShelfApplication], for platform: ShelfPlatform) {
         if platform == .iOS { applications = list } else { visionApplications = list }
+    }
+
+    func applications(for metadata: Project, platform: ShelfPlatform) -> [ShelfApplication] {
+        metadata.ownerOnly == true ? ownerApplications ?? [] : applications(for: platform)
+    }
+
+    // An app listed twice would make clients reject the catalog, so changing audience also leaves the other list.
+    mutating func setApplications(_ list: [ShelfApplication], for metadata: Project, platform: ShelfPlatform) {
+        if metadata.ownerOnly == true {
+            ownerApplications = list
+            applications.removeAll { $0.bundleIdentifier == metadata.bundleIdentifier }
+        } else {
+            setApplications(list, for: platform)
+            ownerApplications?.removeAll { $0.bundleIdentifier == metadata.bundleIdentifier }
+        }
     }
 }
 
@@ -317,8 +334,11 @@ func deliverDirect(directory: String, metadataPath: String = Project.defaultPath
         }
         Thread.sleep(forTimeInterval: 2)
     }
+    guard metadata.ownerOnly != true || metadata.shelfPlatforms == [.iOS] else {
+        throw CommandError(message: "Owner-only shelf apps are iOS only.")
+    }
     let store = try ShelfStore()
-    let devices = try ShelfDevices.load()
+    let devices = try ShelfDevices.load(for: metadata)
     _ = try store.github.repository(name: metadata.name)
     try verifyPersonalRemote(store.github.git(root, ["remote", "get-url", "origin"], remote: false), name: metadata.name)
     guard try store.github.git(root, ["status", "--porcelain"], remote: false).isEmpty else {
@@ -332,7 +352,7 @@ func deliverDirect(directory: String, metadataPath: String = Project.defaultPath
 func deliverDirect(root: URL, metadata: Project, metadataPath: String, platform: ShelfPlatform, store: ShelfStore, devices: ShelfDevices) throws {
     let commit = try store.github.git(root, ["rev-parse", "HEAD"], remote: false)
     let (_, previous) = try store.catalog()
-    let previousApplication = previous.applications(for: platform).first(where: { $0.bundleIdentifier == metadata.bundleIdentifier })
+    let previousApplication = previous.applications(for: metadata, platform: platform).first(where: { $0.bundleIdentifier == metadata.bundleIdentifier })
     if let application = previousApplication, application.sourceCommit == commit, application.profileExpiration > Date().addingTimeInterval(86400), devices.isCurrent(application) {
         _ = try withShelfLock { try store.refresh() }
         try emit(["result": "available-in-shelf", "app": metadata.name, "platform": platform.rawValue, "build": application.build, "team": TestFlightConfiguration.personalTeam, "sourcesChanged": "false"])
@@ -363,7 +383,7 @@ func deliverDirect(root: URL, metadata: Project, metadataPath: String, platform:
     try withShelfLock {
         let (release, latest) = try store.catalog()
         var updated = latest
-        var list = latest.applications(for: platform)
+        var list = latest.applications(for: metadata, platform: platform)
         let cataloged = list.first(where: { $0.bundleIdentifier == application.bundleIdentifier })
         if let cataloged, cataloged.build.compare(build, options: .numeric) == .orderedDescending {
             throw CommandError(message: "A newer build is already available in the shelf. It was preserved.")
@@ -378,7 +398,7 @@ func deliverDirect(root: URL, metadata: Project, metadataPath: String, platform:
         list.removeAll { $0.bundleIdentifier == application.bundleIdentifier }
         list.append(application)
         list.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        updated.setApplications(list, for: platform)
+        updated.setApplications(list, for: metadata, platform: platform)
         try store.updateBody(updated, releaseID: release.id)
         _ = try store.refresh()
     }

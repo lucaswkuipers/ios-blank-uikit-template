@@ -111,6 +111,13 @@ do {
     platformCatalog.setApplications([visionApp], for: .visionOS)
     let decodedPlatforms = try JSONDecoder().decode(ShelfCatalog.self, from: JSONEncoder().encode(platformCatalog))
     try expect(decodedPlatforms.applications(for: .iOS).map(\.bundleIdentifier) == [catalogApps[0].bundleIdentifier] && decodedPlatforms.applications(for: .visionOS).map(\.platform) == ["visionOS"], "visionOS apps stay out of the list older iPhone clients read")
+    let ownerProject = try JSONDecoder().decode(Project.self, from: Data(#"{"name":"Example","bundleIdentifier":"\#(catalogApps[0].bundleIdentifier)","ownerOnly":true}"#.utf8))
+    let sharedProject = try JSONDecoder().decode(Project.self, from: Data(#"{"name":"Example","bundleIdentifier":"\#(catalogApps[0].bundleIdentifier)"}"#.utf8))
+    var ownerCatalog = smallCatalog
+    ownerCatalog.setApplications([catalogApps[0]], for: ownerProject, platform: .iOS)
+    try expect(ownerCatalog.applications.isEmpty && ownerCatalog.applications(for: ownerProject, platform: .iOS).map(\.bundleIdentifier) == [catalogApps[0].bundleIdentifier], "Owner-only apps leave the list older clients, announcements and re-signing read")
+    ownerCatalog.setApplications([catalogApps[0]], for: sharedProject, platform: .iOS)
+    try expect(ownerCatalog.applications.map(\.bundleIdentifier) == [catalogApps[0].bundleIdentifier] && ownerCatalog.ownerApplications?.isEmpty == true, "Apps opened to everyone leave the owner-only list")
     let visionProject = try JSONDecoder().decode(Project.self, from: Data(#"{"name":"Blockport","bundleIdentifier":"com.lucaswkuipers.blockport.vision","product":"Blockport Vision","platforms":["visionOS"],"publishOnRequest":true}"#.utf8))
     try expect(visionProject.productName == "Blockport Vision" && visionProject.shelfPlatforms == [.visionOS] && ShelfPlatform.visionOS.destination == "generic/platform=visionOS", "Projects choose their product and shelf platforms")
 

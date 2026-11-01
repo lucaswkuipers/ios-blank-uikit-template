@@ -49,6 +49,13 @@ struct ShelfDevices {
         Self(configuration: try DirectConfiguration.load(), sharing: try ShelfSharing.load())
     }
 
+    static func load(for metadata: Project) throws -> Self {
+        guard metadata.ownerOnly == true else {
+            return try load()
+        }
+        return Self(configuration: try DirectConfiguration.load(), sharing: ShelfSharing(devices: [], inviteGist: nil))
+    }
+
     func isCurrent(_ application: ShelfApplication) -> Bool {
         (application.deviceSet ?? ownerDeviceID) == identifier
     }
