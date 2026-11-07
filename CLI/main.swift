@@ -5,7 +5,6 @@ struct Simulator: Decodable {
     let name: String
     let udid: String
     let state: String
-    let deviceTypeIdentifier: String?
 }
 
 struct SimulatorList: Decodable {
@@ -109,6 +108,25 @@ func create(name: String, options: Options) throws {
     try emit(result)
 }
 
+struct DeviceClaim: Decodable {
+    struct Device: Decodable {
+        let id: String
+    }
+
+    let device: Device
+}
+
+func leasedSimulators() -> Set<String> {
+    let claims = files.homeDirectoryForCurrentUser.appendingPathComponent(".agent-device/device-claims")
+    let urls = (try? files.contentsOfDirectory(at: claims, includingPropertiesForKeys: nil)) ?? []
+    return Set(urls.compactMap { url in
+        guard let data = try? Data(contentsOf: url) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(DeviceClaim.self, from: data).device.id
+    })
+}
+
 func check(directory: String, options: Options) throws {
     let root = URL(fileURLWithPath: directory).standardizedFileURL
     let metadata = try JSONDecoder().decode(Project.self, from: Data(contentsOf: root.appendingPathComponent(".uikit-app.json")))
@@ -128,19 +146,15 @@ func check(directory: String, options: Options) throws {
         simulator = device.udid
         wasBooted = device.state == "Booted"
     } else {
-        let simulatorName = "UIKit Check \(metadata.name) \(digest)"
-        let sdk = try run("/usr/bin/xcrun", ["--sdk", "iphonesimulator", "--show-sdk-version"], log: nil)
-        let runtime = "com.apple.CoreSimulator.SimRuntime.iOS-\(sdk.replacingOccurrences(of: ".", with: "-"))"
-        guard let runtimeDevices = devices[runtime], let model = runtimeDevices.first(where: { $0.deviceTypeIdentifier?.contains("iPhone") == true })?.deviceTypeIdentifier else {
-            throw CommandError(message: "No iPhone simulator for iOS \(sdk). Pass --simulator <available-UDID>.")
+        let leased = leasedSimulators()
+        let pool = devices.values.flatMap { $0 }
+            .filter { $0.name.range(of: "^Sim [0-9]+$", options: .regularExpression) != nil }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        guard let free = pool.first(where: { $0.state == "Shutdown" && !leased.contains($0.udid) }) else {
+            throw CommandError(message: "No free pool simulator: every Sim N is booted or leased. Wait, or pass --simulator <UDID>.")
         }
-        if let existing = runtimeDevices.first(where: { $0.name == simulatorName }) {
-            simulator = existing.udid
-            wasBooted = existing.state == "Booted"
-        } else {
-            simulator = try run("/usr/bin/xcrun", ["simctl", "create", simulatorName, model, runtime], log: nil)
-            wasBooted = false
-        }
+        simulator = free.udid
+        wasBooted = false
     }
     status("Building for the simulator…")
     try run("/usr/bin/xcodebuild", base + ["-destination", "platform=iOS Simulator,id=\(simulator)", "CODE_SIGNING_ALLOWED=YES", "CODE_SIGN_IDENTITY=-"], log: cache.appendingPathComponent("simulator-build.log"))
@@ -197,8 +211,8 @@ do {
         Commit app features, then publish pushes main and waits for the app's selected delivery workflow.
         create uses the configured delivery route; --delivery shelf|testflight overrides it.
         Every subsequent push to main triggers delivery automatically while the Mac is available.
-        check builds and launches in a simulator, captures a screenshot, and restores a simulator
-        it booted to shutdown. Logs stay in Library/Caches.
+        check builds and launches on a free pool simulator (Sim N, shut down, not leased), captures
+        a screenshot, and shuts it down again. It never creates simulators. Logs stay in Library/Caches.
         testflight registers the app and personal tester, verifies a signed Release archive,
         uploads, and waits for internal availability. No browser or simulator is required.
         check is optional for simulator/behavior verification; it is not needed before testflight.
