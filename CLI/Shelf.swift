@@ -86,14 +86,17 @@ struct ShelfCatalog: Codable {
 // keeps every app it can for them: smaller icons first, then none, then without the longest-unchanged apps, never
 // AppShelf itself, so they can always update to a client that reads the complete catalog asset.
 func shelfCatalogBody(_ catalog: ShelfCatalog, encoder: JSONEncoder) throws -> Data {
-    let budget = 100_000 - 80 * catalog.applications.filter { $0.manifestAssetID == nil }.count
     var body = catalog
     var data = try encoder.encode(body)
-    for maximumPixelSize in [64, 48, 32] where data.count > budget {
+    // Each listed app gets an install link on the next refresh, so one without a link yet keeps room for it.
+    func overBudget() -> Bool {
+        data.count + 80 * body.applications.filter { $0.manifestAssetID == nil }.count > 100_000
+    }
+    for maximumPixelSize in [64, 48, 32] where overBudget() {
         body = try catalog.mapApplications { try shelfThumbnail($0, maximumPixelSize: maximumPixelSize) }
         data = try encoder.encode(body)
     }
-    if data.count > budget {
+    if overBudget() {
         body = body.mapApplications { application in
             var application = application
             application.iconPNG = nil
@@ -101,7 +104,7 @@ func shelfCatalogBody(_ catalog: ShelfCatalog, encoder: JSONEncoder) throws -> D
         }
         data = try encoder.encode(body)
     }
-    while data.count > budget {
+    while overBudget() {
         let entries = body.applications + (body.visionApplications ?? []) + (body.ownerApplications ?? [])
         guard let oldest = entries.filter({ $0.bundleIdentifier != "com.lucaswkuipers.AppShelf" }).min(by: { $0.publishedAt < $1.publishedAt }) else {
             throw CommandError(message: "AppShelf's own catalog entries exceed GitHub's release-description budget.")

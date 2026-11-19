@@ -106,8 +106,13 @@ do {
     for app in compactCatalog.applications {
         try expect(CGImageSourceCreateWithData(Data(base64Encoded: app.iconPNG!)! as CFData, nil) != nil, "Compacted icons remain decodable images")
     }
+    let catalogEncoder = JSONEncoder()
+    catalogEncoder.dateEncodingStrategy = .iso8601
+    catalogEncoder.outputFormatting = [.sortedKeys]
+    let catalogDecoder = JSONDecoder()
+    catalogDecoder.dateDecodingStrategy = .iso8601
     let smallCatalog = ShelfCatalog(schema: 1, applications: [catalogApps[0]], invitation: nil)
-    try expect(try shelfCatalogBody(smallCatalog, encoder: JSONEncoder()) == JSONEncoder().encode(smallCatalog), "Catalogs below the budget retain their original thumbnails")
+    try expect(try shelfCatalogBody(smallCatalog, encoder: catalogEncoder) == catalogEncoder.encode(smallCatalog), "Catalogs below the budget retain their original thumbnails")
     var visionApps = Array(catalogApps.prefix(5))
     for index in visionApps.indices {
         visionApps[index].platform = ShelfPlatform.visionOS.catalogValue
@@ -116,11 +121,6 @@ do {
     let unsharedBody = try JSONDecoder().decode(ShelfCatalog.self, from: shelfCatalogBody(unsharedCatalog, encoder: JSONEncoder()))
     try expect((unsharedBody.visionApplications ?? []).count == 5 && (unsharedBody.ownerApplications ?? []).count == 5 && (unsharedBody.visionApplications! + unsharedBody.ownerApplications!).allSatisfy { $0.iconPNG != nil }, "Owner-only and visionOS icons shrink to fit the release body too")
 
-    let catalogEncoder = JSONEncoder()
-    catalogEncoder.dateEncodingStrategy = .iso8601
-    catalogEncoder.outputFormatting = [.sortedKeys]
-    let catalogDecoder = JSONDecoder()
-    catalogDecoder.dateDecodingStrategy = .iso8601
     let plainIcon = try shelfIconFixture(pixels: 128, noisy: false)
     let shelfApp = ShelfApplication(name: "AppShelf", bundleIdentifier: "com.lucaswkuipers.AppShelf", version: "1.0", build: "30", minimumOSVersion: "15.0", profileExpiration: .distantFuture, sourceCommit: "commit", sha256: "digest", size: 42, packageAssetID: 5000, publishedAt: .distantPast, manifestAssetID: 6000, installExpiration: .distantFuture, iconPNG: plainIcon)
     let shelfVisionApp = ShelfApplication(name: "AppShelf", bundleIdentifier: "com.lucaswkuipers.AppShelf", version: "1.0", build: "30", minimumOSVersion: "2.0", profileExpiration: .distantFuture, sourceCommit: "commit", sha256: "digest", size: 42, packageAssetID: 5001, publishedAt: .distantPast, iconPNG: plainIcon, platform: ShelfPlatform.visionOS.catalogValue)
@@ -151,6 +151,16 @@ do {
     }
     let relinkedListed = Set(try catalogDecoder.decode(ShelfCatalog.self, from: shelfCatalogBody(relinkedCatalog, encoder: catalogEncoder)).applications.map(\.packageAssetID))
     try expect(relinkedListed.isSuperset(of: unlinkedListed), "Install links for listed apps never push those apps out of the release body")
+    let listedPackages = Set(largeListed.applications.map(\.packageAssetID))
+    let leftOutUnlinked = largeCatalog.mapApplications { application in
+        var application = application
+        if !listedPackages.contains(application.packageAssetID) {
+            application.manifestAssetID = nil
+            application.installExpiration = nil
+        }
+        return application
+    }
+    try expect(Set(try catalogDecoder.decode(ShelfCatalog.self, from: shelfCatalogBody(leftOutUnlinked, encoder: catalogEncoder)).applications.map(\.packageAssetID)) == listedPackages, "Apps left out of the release body keep no room for install links they never get")
     var pointedCatalog = largeCatalog
     pointedCatalog.catalogAsset = ShelfCatalogAsset(id: 990, sha256: "previous", size: 1)
     let assetData = try shelfCatalogAsset(pointedCatalog, encoder: catalogEncoder)
