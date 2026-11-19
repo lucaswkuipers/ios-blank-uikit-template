@@ -822,7 +822,7 @@ func setupShelfRequests(template: URL) throws {
         let (release, catalog) = try store.catalog()
         var updated = catalog
         updated.invitation = "\(url)/"
-        try store.updateBody(updated, releaseID: release.id)
+        try store.save(updated, release: release)
     }
     let qrCode = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/ShelfInvite/AppShelf-request.png")
     try files.createDirectory(at: qrCode.deletingLastPathComponent(), withIntermediateDirectories: true)

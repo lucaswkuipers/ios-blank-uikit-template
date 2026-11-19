@@ -28,6 +28,21 @@ func expectFailure(_ operation: () throws -> Void) throws {
     throw CommandError(message: "Operation unexpectedly succeeded")
 }
 
+func shelfIconFixture(pixels: Int, noisy: Bool) throws -> String {
+    var bytes = Data(count: pixels * pixels * 4)
+    var random: UInt32 = 1
+    for index in bytes.indices {
+        random = random &* 1664525 &+ 1013904223
+        bytes[index] = index % 4 == 3 ? 255 : noisy ? UInt8(truncatingIfNeeded: random >> 16) : 128
+    }
+    let image = CGImage(width: pixels, height: pixels, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: pixels * 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue), provider: CGDataProvider(data: bytes as CFData)!, decode: nil, shouldInterpolate: true, intent: .defaultIntent)!
+    let data = NSMutableData()
+    let destination = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil)!
+    CGImageDestinationAddImage(destination, image, nil)
+    try expect(CGImageDestinationFinalize(destination), "Create a catalog icon fixture")
+    return (data as Data).base64EncodedString()
+}
+
 func decodeBase64URL(_ text: String) -> Data {
     let base = text.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
     return Data(base64Encoded: base + String(repeating: "=", count: (4 - base.count % 4) % 4))!
@@ -70,23 +85,12 @@ do {
     try "2022.3.8f1".write(to: unity.appendingPathComponent("ProjectSettings/ProjectVersion.txt"), atomically: true, encoding: .utf8)
     try expect(try sourceFingerprint(unity) != unityFingerprint, "Unity project settings remain part of the source fingerprint")
 
-    var pixels = Data(count: 128 * 128 * 4)
-    var random: UInt32 = 1
-    for index in pixels.indices {
-        random = random &* 1664525 &+ 1013904223
-        pixels[index] = index % 4 == 3 ? 255 : UInt8(truncatingIfNeeded: random >> 16)
-    }
-    let iconProvider = CGDataProvider(data: pixels as CFData)!
-    let iconImage = CGImage(width: 128, height: 128, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 512, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue), provider: iconProvider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)!
-    let iconData = NSMutableData()
-    let iconDestination = CGImageDestinationCreateWithData(iconData, "public.png" as CFString, 1, nil)!
-    CGImageDestinationAddImage(iconDestination, iconImage, nil)
-    try expect(CGImageDestinationFinalize(iconDestination), "Create the noisy catalog icon fixture")
+    let noisyIcon = try shelfIconFixture(pixels: 128, noisy: true)
     let catalogApps = (0..<10).map { index in
-        ShelfApplication(name: "App \(index)", bundleIdentifier: "com.lucaswkuipers.App\(index)", version: "1.0", build: "1", minimumOSVersion: "27.0", profileExpiration: .distantFuture, sourceCommit: "commit", sha256: "digest", size: 42, packageAssetID: index + 1, publishedAt: .distantPast, manifestAssetID: index + 100, installExpiration: .distantFuture, iconPNG: (iconData as Data).base64EncodedString())
+        ShelfApplication(name: "App \(index)", bundleIdentifier: "com.lucaswkuipers.App\(index)", version: "1.0", build: "1", minimumOSVersion: "27.0", profileExpiration: .distantFuture, sourceCommit: "commit", sha256: "digest", size: 42, packageAssetID: index + 1, publishedAt: .distantPast, manifestAssetID: index + 100, installExpiration: .distantFuture, iconPNG: noisyIcon)
     }
     let oversizedCatalog = ShelfCatalog(schema: 1, applications: catalogApps, invitation: "https://example.com/invite")
-    let compactCatalogData = try shelfCatalogData(oversizedCatalog, encoder: JSONEncoder())
+    let compactCatalogData = try shelfCatalogBody(oversizedCatalog, encoder: JSONEncoder())
     let compactCatalog = try JSONDecoder().decode(ShelfCatalog.self, from: compactCatalogData)
     try expect(compactCatalogData.count <= 100_000, "Catalog thumbnails must leave headroom below GitHub's release body limit")
     try expect(compactCatalog.applications.map(\.manifestAssetID) == catalogApps.map(\.manifestAssetID) && compactCatalog.invitation == oversizedCatalog.invitation, "Compacting icons preserves installation links and the invitation")
@@ -94,16 +98,77 @@ do {
     let manifests = (0..<1000).map { index in
         ShelfAsset(id: index, name: "manifest-\(index).plist", created_at: ISO8601DateFormatter().string(from: pruneTime.addingTimeInterval(-Double(index) * 2)), size: 1, digest: nil)
     }
-    let pruned = Set(staleShelfManifests(manifests, active: [999, 5], now: pruneTime).map(\.id))
+    let pruned = Set(staleShelfAssets(manifests, active: [999, 5], now: pruneTime).map(\.id))
     try expect(!pruned.contains(999) && !pruned.contains(5), "Pruning keeps manifests the catalog still links")
     try expect(!pruned.contains(0) && !pruned.contains(299) && pruned.contains(301) && pruned.contains(998), "Pruning keeps recent manifests and removes old superseded ones")
     try expect(manifests.count - pruned.count <= 302, "Pruning leaves room below GitHub's asset limit")
-    try expect(staleShelfManifests(Array(manifests.prefix(50)), active: [], now: pruneTime).isEmpty, "Recent superseded manifests stay for clients mid-install")
+    try expect(staleShelfAssets(Array(manifests.prefix(50)), active: [], now: pruneTime).isEmpty, "Recent superseded manifests stay for clients mid-install")
     for app in compactCatalog.applications {
         try expect(CGImageSourceCreateWithData(Data(base64Encoded: app.iconPNG!)! as CFData, nil) != nil, "Compacted icons remain decodable images")
     }
     let smallCatalog = ShelfCatalog(schema: 1, applications: [catalogApps[0]], invitation: nil)
-    try expect(try shelfCatalogData(smallCatalog, encoder: JSONEncoder()) == JSONEncoder().encode(smallCatalog), "Catalogs below the budget retain their original thumbnails")
+    try expect(try shelfCatalogBody(smallCatalog, encoder: JSONEncoder()) == JSONEncoder().encode(smallCatalog), "Catalogs below the budget retain their original thumbnails")
+    var visionApps = Array(catalogApps.prefix(5))
+    for index in visionApps.indices {
+        visionApps[index].platform = ShelfPlatform.visionOS.catalogValue
+    }
+    let unsharedCatalog = ShelfCatalog(schema: 1, applications: [], invitation: nil, visionApplications: visionApps, ownerApplications: Array(catalogApps.suffix(5)))
+    let unsharedBody = try JSONDecoder().decode(ShelfCatalog.self, from: shelfCatalogBody(unsharedCatalog, encoder: JSONEncoder()))
+    try expect((unsharedBody.visionApplications ?? []).count == 5 && (unsharedBody.ownerApplications ?? []).count == 5 && (unsharedBody.visionApplications! + unsharedBody.ownerApplications!).allSatisfy { $0.iconPNG != nil }, "Owner-only and visionOS icons shrink to fit the release body too")
+
+    let catalogEncoder = JSONEncoder()
+    catalogEncoder.dateEncodingStrategy = .iso8601
+    catalogEncoder.outputFormatting = [.sortedKeys]
+    let catalogDecoder = JSONDecoder()
+    catalogDecoder.dateDecodingStrategy = .iso8601
+    let plainIcon = try shelfIconFixture(pixels: 128, noisy: false)
+    let shelfApp = ShelfApplication(name: "AppShelf", bundleIdentifier: "com.lucaswkuipers.AppShelf", version: "1.0", build: "30", minimumOSVersion: "15.0", profileExpiration: .distantFuture, sourceCommit: "commit", sha256: "digest", size: 42, packageAssetID: 5000, publishedAt: .distantPast, manifestAssetID: 6000, installExpiration: .distantFuture, iconPNG: plainIcon)
+    let shelfVisionApp = ShelfApplication(name: "AppShelf", bundleIdentifier: "com.lucaswkuipers.AppShelf", version: "1.0", build: "30", minimumOSVersion: "2.0", profileExpiration: .distantFuture, sourceCommit: "commit", sha256: "digest", size: 42, packageAssetID: 5001, publishedAt: .distantPast, iconPNG: plainIcon, platform: ShelfPlatform.visionOS.catalogValue)
+    let manyApps = (0..<400).map { index in
+        ShelfApplication(name: "App \(index)", bundleIdentifier: "com.lucaswkuipers.Many\(index)", version: "1.0", build: "1", minimumOSVersion: "27.0", profileExpiration: .distantFuture, sourceCommit: String(repeating: "c", count: 40), sha256: String(repeating: "d", count: 64), size: 42, packageAssetID: 10_000 + index, publishedAt: Date(timeIntervalSince1970: 1_800_000_000 + Double(index) * 60), manifestAssetID: 766_000_000 + index, installExpiration: Date(timeIntervalSince1970: 1_800_000_000), iconPNG: plainIcon, notificationTitle: "Update available", deviceSet: "0123456789abcdef", silent: false, releaseNotes: ["Change \(index)"])
+    }
+    let largeCatalog = ShelfCatalog(schema: 1, applications: [shelfApp] + manyApps, invitation: "https://example.com/invite", visionApplications: [shelfVisionApp])
+    let largeBody = try shelfCatalogBody(largeCatalog, encoder: catalogEncoder)
+    let largeListed = try catalogDecoder.decode(ShelfCatalog.self, from: largeBody)
+    let keptApps = largeListed.applications.filter { $0.bundleIdentifier != shelfApp.bundleIdentifier }
+    try expect(largeBody.count <= 100_000, "Hundreds of apps still fit GitHub's release body")
+    try expect(largeListed.applications.first?.packageAssetID == shelfApp.packageAssetID && largeListed.visionApplications?.map(\.packageAssetID) == [shelfVisionApp.packageAssetID], "Older clients can always update AppShelf")
+    try expect(keptApps.count > 50 && keptApps.count < manyApps.count && keptApps.map(\.packageAssetID) == manyApps.suffix(keptApps.count).map(\.packageAssetID), "A full release body leaves out the longest-unchanged apps first")
+    let unlinkedCatalog = largeCatalog.mapApplications { application in
+        var application = application
+        application.manifestAssetID = nil
+        application.installExpiration = nil
+        return application
+    }
+    let unlinkedListed = Set(try catalogDecoder.decode(ShelfCatalog.self, from: shelfCatalogBody(unlinkedCatalog, encoder: catalogEncoder)).applications.map(\.packageAssetID))
+    let relinkedCatalog = unlinkedCatalog.mapApplications { application in
+        var application = application
+        if unlinkedListed.contains(application.packageAssetID) {
+            application.manifestAssetID = 9_999_999_999
+            application.installExpiration = .distantFuture
+        }
+        return application
+    }
+    let relinkedListed = Set(try catalogDecoder.decode(ShelfCatalog.self, from: shelfCatalogBody(relinkedCatalog, encoder: catalogEncoder)).applications.map(\.packageAssetID))
+    try expect(relinkedListed.isSuperset(of: unlinkedListed), "Install links for listed apps never push those apps out of the release body")
+    var pointedCatalog = largeCatalog
+    pointedCatalog.catalogAsset = ShelfCatalogAsset(id: 990, sha256: "previous", size: 1)
+    let assetData = try shelfCatalogAsset(pointedCatalog, encoder: catalogEncoder)
+    let assetFile = temporary.appendingPathComponent("catalog.json.gz")
+    try assetData.write(to: assetFile)
+    try run("/usr/bin/gzip", ["--test", assetFile.path], log: nil)
+    let completeCatalog = try catalogDecoder.decode(ShelfCatalog.self, from: shelfGunzip(assetData))
+    try expect(completeCatalog.catalogAsset == nil && (completeCatalog.applications + (completeCatalog.visionApplications ?? [])).allSatisfy { $0.manifestAssetID == nil && $0.installExpiration == nil }, "The catalog asset leaves out the install links that change every few minutes")
+    try expect(completeCatalog.applications.count == largeCatalog.applications.count && completeCatalog.applications.allSatisfy { $0.iconPNG == plainIcon } && completeCatalog.invitation == largeCatalog.invitation, "The catalog asset keeps every app with its original icon")
+    let linkedCatalog = shelfCatalog(completeCatalog, linkedFrom: largeListed)
+    let listedLinks = Dictionary(uniqueKeysWithValues: largeListed.applications.map { ($0.packageAssetID, $0.manifestAssetID) })
+    try expect(linkedCatalog.applications.allSatisfy { $0.manifestAssetID == listedLinks[$0.packageAssetID] ?? nil } && linkedCatalog.visionApplications?.first?.manifestAssetID == nil, "Install links come back from the release body for the packages it lists")
+    try expect(pointedCatalog.linkedAssetIDs.contains(990) && !staleShelfAssets(manifests, active: pointedCatalog.linkedAssetIDs, now: pruneTime).contains { $0.id == 990 }, "Pruning keeps the catalog asset the release body names")
+    let catalogAssets = (0..<3).map { index in
+        ShelfAsset(id: 2000 + index, name: "catalog-\(index).json.gz", created_at: ISO8601DateFormatter().string(from: pruneTime.addingTimeInterval(-86400 * Double(index + 1))), size: 1, digest: nil)
+    }
+    try expect(Set(staleShelfAssets(catalogAssets, active: [2000], now: pruneTime).map(\.id)) == [2002], "Pruning keeps the catalog asset replaced last for clients that read the body just before")
+    try expectFailure { _ = try shelfGunzip(Data("{\"schema\":1}".utf8)) }
     try expect(!String(decoding: try JSONEncoder().encode(smallCatalog), as: UTF8.self).contains("visionApplications"), "Catalogs without visionOS apps keep their existing shape")
     var platformCatalog = smallCatalog
     var visionApp = catalogApps[1]

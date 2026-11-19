@@ -1,5 +1,7 @@
+import CryptoKit
 import Foundation
 import ImageIO
+import zlib
 
 struct ShelfApplication: Codable {
     let name: String
@@ -23,6 +25,12 @@ struct ShelfApplication: Codable {
     var platform: String?
 }
 
+struct ShelfCatalogAsset: Codable, Equatable {
+    let id: Int
+    let sha256: String
+    let size: Int
+}
+
 struct ShelfCatalog: Codable {
     let schema: Int
     var applications: [ShelfApplication]
@@ -31,6 +39,24 @@ struct ShelfCatalog: Codable {
     var visionApplications: [ShelfApplication]?
     // Only the owner's AppShelf lists these. Older clients, announcements and device re-signing never read this list.
     var ownerApplications: [ShelfApplication]?
+    // Set in the release body, which older clients read whole: the complete catalog is this gzip'd release asset.
+    var catalogAsset: ShelfCatalogAsset?
+
+    var linkedAssetIDs: Set<Int> {
+        var identifiers = Set(applications.compactMap(\.manifestAssetID))
+        if let catalogAsset {
+            identifiers.insert(catalogAsset.id)
+        }
+        return identifiers
+    }
+
+    func mapApplications(_ transform: (ShelfApplication) throws -> ShelfApplication) rethrows -> ShelfCatalog {
+        var catalog = self
+        catalog.applications = try applications.map(transform)
+        catalog.visionApplications = try visionApplications?.map(transform)
+        catalog.ownerApplications = try ownerApplications?.map(transform)
+        return catalog
+    }
 
     func applications(for platform: ShelfPlatform) -> [ShelfApplication] {
         platform == .iOS ? applications : visionApplications ?? []
@@ -56,36 +82,110 @@ struct ShelfCatalog: Codable {
     }
 }
 
-func shelfCatalogData(_ value: ShelfCatalog, encoder: JSONEncoder) throws -> Data {
-    var catalog = value
-    var data = try encoder.encode(catalog)
-    var exhausted = Set<Int>()
-    while data.count > 100_000 {
-        guard let index = catalog.applications.indices.filter({ !exhausted.contains($0) && catalog.applications[$0].iconPNG != nil }).max(by: { (catalog.applications[$0].iconPNG?.count ?? 0) < (catalog.applications[$1].iconPNG?.count ?? 0) }),
-              let encoded = catalog.applications[index].iconPNG,
-              let icon = Data(base64Encoded: encoded),
-              let source = CGImageSourceCreateWithData(icon as CFData, nil),
-              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-              let width = properties[kCGImagePropertyPixelWidth] as? Int,
-              let height = properties[kCGImagePropertyPixelHeight] as? Int else {
-            throw CommandError(message: "The catalog exceeds GitHub's release-description budget and its icons cannot be reduced further.")
+// GitHub allows 125,000 characters per release description, and older AppShelf clients read nothing else. The body
+// keeps every app it can for them: smaller icons first, then none, then without the longest-unchanged apps, never
+// AppShelf itself, so they can always update to a client that reads the complete catalog asset.
+func shelfCatalogBody(_ catalog: ShelfCatalog, encoder: JSONEncoder) throws -> Data {
+    let budget = 100_000 - 80 * catalog.applications.filter { $0.manifestAssetID == nil }.count
+    var body = catalog
+    var data = try encoder.encode(body)
+    for maximumPixelSize in [64, 48, 32] where data.count > budget {
+        body = try catalog.mapApplications { try shelfThumbnail($0, maximumPixelSize: maximumPixelSize) }
+        data = try encoder.encode(body)
+    }
+    if data.count > budget {
+        body = body.mapApplications { application in
+            var application = application
+            application.iconPNG = nil
+            return application
         }
-        let dimension = max(width, height)
-        if dimension <= 32 {
-            exhausted.insert(index)
-            continue
+        data = try encoder.encode(body)
+    }
+    while data.count > budget {
+        let entries = body.applications + (body.visionApplications ?? []) + (body.ownerApplications ?? [])
+        guard let oldest = entries.filter({ $0.bundleIdentifier != "com.lucaswkuipers.AppShelf" }).min(by: { $0.publishedAt < $1.publishedAt }) else {
+            throw CommandError(message: "AppShelf's own catalog entries exceed GitHub's release-description budget.")
         }
-        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: max(32, dimension * 3 / 4)] as CFDictionary) else {
-            throw CommandError(message: "Cannot resize a catalog thumbnail.")
-        }
-        let thumbnail = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(thumbnail, "public.png" as CFString, 1, nil) else {
-            throw CommandError(message: "Cannot encode a catalog thumbnail.")
-        }
-        CGImageDestinationAddImage(destination, image, nil)
-        guard CGImageDestinationFinalize(destination) else { throw CommandError(message: "Cannot finish a catalog thumbnail.") }
-        catalog.applications[index].iconPNG = (thumbnail as Data).base64EncodedString()
-        data = try encoder.encode(catalog)
+        body.applications.removeAll { $0.packageAssetID == oldest.packageAssetID }
+        body.visionApplications?.removeAll { $0.packageAssetID == oldest.packageAssetID }
+        body.ownerApplications?.removeAll { $0.packageAssetID == oldest.packageAssetID }
+        data = try encoder.encode(body)
+    }
+    return data
+}
+
+// Install links change every few minutes and only older clients use them, so they stay in the release body.
+func shelfCatalogAsset(_ catalog: ShelfCatalog, encoder: JSONEncoder) throws -> Data {
+    var complete = catalog.mapApplications { application in
+        var application = application
+        application.manifestAssetID = nil
+        application.installExpiration = nil
+        return application
+    }
+    complete.catalogAsset = nil
+    return try shelfGzip(encoder.encode(complete))
+}
+
+func shelfCatalog(_ complete: ShelfCatalog, linkedFrom body: ShelfCatalog) -> ShelfCatalog {
+    var catalog = complete.mapApplications { application in
+        var application = application
+        let listed = body.applications.first { $0.packageAssetID == application.packageAssetID }
+        application.manifestAssetID = listed?.manifestAssetID
+        application.installExpiration = listed?.installExpiration
+        return application
+    }
+    catalog.catalogAsset = body.catalogAsset
+    return catalog
+}
+
+func shelfThumbnail(_ application: ShelfApplication, maximumPixelSize: Int) throws -> ShelfApplication {
+    guard let encoded = application.iconPNG else {
+        return application
+    }
+    guard let icon = Data(base64Encoded: encoded),
+          let source = CGImageSourceCreateWithData(icon as CFData, nil),
+          let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          let width = properties[kCGImagePropertyPixelWidth] as? Int,
+          let height = properties[kCGImagePropertyPixelHeight] as? Int else {
+        throw CommandError(message: "Cannot read the catalog icon of \(application.name).")
+    }
+    guard max(width, height) > maximumPixelSize else {
+        return application
+    }
+    guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize] as CFDictionary) else {
+        throw CommandError(message: "Cannot resize a catalog thumbnail.")
+    }
+    let thumbnail = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(thumbnail, "public.png" as CFString, 1, nil) else {
+        throw CommandError(message: "Cannot encode a catalog thumbnail.")
+    }
+    CGImageDestinationAddImage(destination, image, nil)
+    guard CGImageDestinationFinalize(destination) else {
+        throw CommandError(message: "Cannot finish a catalog thumbnail.")
+    }
+    var resized = application
+    resized.iconPNG = (thumbnail as Data).base64EncodedString()
+    return resized
+}
+
+func shelfGzip(_ data: Data) throws -> Data {
+    var archive = Data([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3])
+    archive.append(try (data as NSData).compressed(using: .zlib) as Data)
+    let checksum = data.withUnsafeBytes { UInt32(crc32(0, $0.bindMemory(to: Bytef.self).baseAddress, uInt($0.count))) }
+    for value in [checksum, UInt32(truncatingIfNeeded: data.count)] {
+        withUnsafeBytes(of: value.littleEndian) { archive.append(contentsOf: $0) }
+    }
+    return archive
+}
+
+func shelfGunzip(_ archive: Data) throws -> Data {
+    guard archive.count > 18, archive.starts(with: [0x1f, 0x8b, 8, 0]) else {
+        throw CommandError(message: "The shelf catalog asset is not a plain gzip file.")
+    }
+    let data = try (Data(archive.dropFirst(10).dropLast(8)) as NSData).decompressed(using: .zlib) as Data
+    let size = archive.suffix(4).map(UInt32.init)
+    guard size[0] | size[1] << 8 | size[2] << 16 | size[3] << 24 == UInt32(truncatingIfNeeded: data.count) else {
+        throw CommandError(message: "The shelf catalog asset is truncated.")
     }
     return data
 }
@@ -154,6 +254,7 @@ func shelfDownloadExpiration(_ url: URL) throws -> Date {
 
 struct ShelfStore {
     static let repository = "lucaswkuipers/AppShelf-builds"
+    static let catalogCache = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/uikit-app/ShelfCatalog")
     let github: PersonalGitHub
     let encoder: JSONEncoder
     let decoder: JSONDecoder
@@ -171,19 +272,86 @@ struct ShelfStore {
     func catalog() throws -> (ShelfRelease, ShelfCatalog) {
         let output = try github.call(["api", "repos/\(Self.repository)/releases/tags/catalog"])
         let release = try decoder.decode(ShelfRelease.self, from: Data(output.utf8))
+        let body = try catalogBody(release)
+        guard let asset = body.catalogAsset else {
+            return (release, body)
+        }
+        let complete = try decoder.decode(ShelfCatalog.self, from: shelfGunzip(catalogAssetData(asset)))
+        guard complete.schema == 1 else { throw CommandError(message: "Unsupported shelf catalog version.") }
+        return (release, shelfCatalog(complete, linkedFrom: body))
+    }
+
+    func catalogBody(_ release: ShelfRelease) throws -> ShelfCatalog {
         guard !release.draft, let body = release.body else { throw CommandError(message: "Shelf catalog is unavailable.") }
         let catalog = try decoder.decode(ShelfCatalog.self, from: Data(body.utf8))
         guard catalog.schema == 1 else { throw CommandError(message: "Unsupported shelf catalog version.") }
-        return (release, catalog)
+        return catalog
     }
 
-    func updateBody<T: Encodable>(_ value: T, releaseID: Int) throws {
+    func save(_ catalog: ShelfCatalog, release: ShelfRelease) throws {
+        var body = catalog
+        body.catalogAsset = try catalogAsset(shelfCatalogAsset(catalog, encoder: encoder), release: release)
+        try updateBody(data: shelfCatalogBody(body, encoder: encoder), releaseID: release.id)
+    }
+
+    func updateBody(_ application: ShelfApplication, releaseID: Int) throws {
+        try updateBody(data: encoder.encode(application), releaseID: releaseID)
+    }
+
+    private func updateBody(data: Data, releaseID: Int) throws {
         let temporary = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? files.removeItem(at: temporary) }
-        let data = try (value as? ShelfCatalog).map { try shelfCatalogData($0, encoder: encoder) } ?? encoder.encode(value)
         let body = String(decoding: data, as: UTF8.self)
         try JSONSerialization.data(withJSONObject: ["body": body]).write(to: temporary, options: .atomic)
         try github.call(["api", "--method", "PATCH", "repos/\(Self.repository)/releases/\(releaseID)", "--input", temporary.path])
+    }
+
+    // Named by content, so an unchanged catalog reuses its asset and a missing one is uploaded again.
+    private func catalogAsset(_ data: Data, release: ShelfRelease) throws -> ShelfCatalogAsset {
+        let sha256 = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let name = "catalog-\(sha256).json.gz"
+        if let existing = release.assets.first(where: { $0.name == name }) {
+            if existing.size == data.count, existing.digest == "sha256:\(sha256)" {
+                return ShelfCatalogAsset(id: existing.id, sha256: sha256, size: data.count)
+            }
+            try github.call(["api", "--method", "DELETE", "repos/\(Self.repository)/releases/assets/\(existing.id)"])
+        }
+        let temporary = files.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).json.gz")
+        defer { try? files.removeItem(at: temporary) }
+        try data.write(to: temporary, options: .atomic)
+        let asset = try upload(temporary, name: name, contentType: "application/gzip", releaseID: release.id)
+        guard asset.size == data.count, asset.digest == "sha256:\(sha256)" else {
+            throw CommandError(message: "GitHub's uploaded catalog size or checksum differs. The previous catalog was kept.")
+        }
+        try cacheCatalogAsset(data, sha256: sha256)
+        return ShelfCatalogAsset(id: asset.id, sha256: sha256, size: data.count)
+    }
+
+    private func catalogAssetData(_ asset: ShelfCatalogAsset) throws -> Data {
+        let cached = Self.catalogCache.appendingPathComponent("\(asset.sha256).json.gz")
+        if let data = try? Data(contentsOf: cached), data.count == asset.size, SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == asset.sha256 {
+            return data
+        }
+        let (url, _) = try downloadLink(assetID: asset.id)
+        let temporary = files.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).json.gz")
+        defer { try? files.removeItem(at: temporary) }
+        try run("/usr/bin/curl", ["--fail", "--silent", "--show-error", "--connect-timeout", "15", "--max-time", "120",
+            "--output", temporary.path, url.absoluteString], log: nil)
+        let data = try Data(contentsOf: temporary)
+        guard data.count == asset.size, SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == asset.sha256 else {
+            throw CommandError(message: "The downloaded shelf catalog differs from the checksum its release names.")
+        }
+        try cacheCatalogAsset(data, sha256: asset.sha256)
+        return data
+    }
+
+    private func cacheCatalogAsset(_ data: Data, sha256: String) throws {
+        let path = Self.catalogCache.appendingPathComponent("\(sha256).json.gz")
+        try files.createDirectory(at: Self.catalogCache, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        for name in try files.contentsOfDirectory(atPath: Self.catalogCache.path) where name.hasSuffix(".json.gz") && name != path.lastPathComponent {
+            try? files.removeItem(at: Self.catalogCache.appendingPathComponent(name))
+        }
+        try data.write(to: path, options: .atomic)
     }
 
     func upload(_ file: URL, name: String, contentType: String, releaseID: Int) throws -> ShelfAsset {
@@ -224,12 +392,14 @@ struct ShelfStore {
     func refresh() throws -> ShelfCatalog {
         let (release, previous) = try catalog()
         // Pruning before uploading keeps a full release from blocking its own cleanup.
-        for asset in staleShelfManifests(release.assets, active: Set(previous.applications.compactMap(\.manifestAssetID))) {
+        for asset in staleShelfAssets(release.assets, active: previous.linkedAssetIDs) {
             try github.call(["api", "--method", "DELETE", "repos/\(Self.repository)/releases/assets/\(asset.id)"])
         }
+        // Only older clients use these links, and they see only the apps the release body still lists.
+        let listed = Set(try catalogBody(release).applications.map(\.packageAssetID))
         var updated = previous
         var changed = false
-        for index in updated.applications.indices {
+        for index in updated.applications.indices where listed.contains(updated.applications[index].packageAssetID) {
             let application = updated.applications[index]
             guard application.profileExpiration > Date().addingTimeInterval(86400) else {
                 changed = changed || application.manifestAssetID != nil || application.installExpiration != nil
@@ -251,19 +421,22 @@ struct ShelfStore {
             updated.applications[index].installExpiration = expiration
             changed = true
         }
-        if changed { try updateBody(updated, releaseID: release.id) }
+        if changed { try save(updated, release: release) }
         try publishShelfNotifications(updated)
         return updated
     }
 }
 
 // Legacy manifests embed GitHub package links that expire within minutes, so superseded ones are dead soon after
-// upload. The count cap keeps GitHub's 1,000-asset release limit out of reach however many apps the shelf holds.
-func staleShelfManifests(_ assets: [ShelfAsset], active: Set<Int>, now: Date = Date()) -> [ShelfAsset] {
+// upload. Clients download the catalog asset right after reading the body that names it, so only the one replaced
+// last can still be on its way. The count cap keeps GitHub's 1,000-asset release limit out of reach however many apps
+// the shelf holds.
+func staleShelfAssets(_ assets: [ShelfAsset], active: Set<Int>, now: Date = Date()) -> [ShelfAsset] {
     let formatter = ISO8601DateFormatter()
     let superseded = assets.filter { !active.contains($0.id) }.sorted { $0.created_at > $1.created_at }
+    let replacedCatalog = superseded.first { $0.name.hasPrefix("catalog-") }
     return superseded.enumerated().filter { index, asset in
-        index >= 300 || formatter.date(from: asset.created_at).map { $0 < now.addingTimeInterval(-900) } == true
+        asset.id != replacedCatalog?.id && (index >= 300 || formatter.date(from: asset.created_at).map { $0 < now.addingTimeInterval(-900) } == true)
     }.map(\.element)
 }
 
@@ -399,7 +572,7 @@ func deliverDirect(root: URL, metadata: Project, metadataPath: String, platform:
         list.append(application)
         list.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         updated.setApplications(list, for: metadata, platform: platform)
-        try store.updateBody(updated, releaseID: release.id)
+        try store.save(updated, release: release)
         _ = try store.refresh()
     }
     try emit(["result": "available-in-shelf", "app": metadata.name, "platform": platform.rawValue, "build": build, "team": TestFlightConfiguration.personalTeam, "sourcesChanged": String(try sourceFingerprint(root) != package.fingerprint)])

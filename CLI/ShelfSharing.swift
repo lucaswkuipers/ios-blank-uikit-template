@@ -315,7 +315,7 @@ func catalogResignedPackages(_ applications: [ShelfApplication], store: ShelfSto
             }
             catalog.applications[index] = application
         }
-        try store.updateBody(catalog, releaseID: release.id)
+        try store.save(catalog, release: release)
         _ = try store.refresh()
     }
 }
