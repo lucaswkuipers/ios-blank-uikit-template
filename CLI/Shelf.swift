@@ -636,41 +636,133 @@ func publishShelfArtifact(store: ShelfStore, tag: String, title: String, intent:
 }
 
 func shelfIcon(root: URL, metadata: Project) throws -> String? {
-    let image: URL
-    if let path = metadata.iconImage {
-        image = root.appendingPathComponent(path).standardizedFileURL.resolvingSymlinksInPath()
-        guard image.path.hasPrefix(root.path + "/") else {
+    try shelfIcon(metadata: metadata) { path in
+        let file = root.appendingPathComponent(path).standardizedFileURL.resolvingSymlinksInPath()
+        guard file.path.hasPrefix(root.path + "/") else {
             throw CommandError(message: "The shelf icon must be inside the app repository.")
         }
+        guard files.fileExists(atPath: file.path) else {
+            return nil
+        }
+        return try Data(contentsOf: file)
+    }
+}
+
+// AppShelf shows icons at up to 80 points on 3x screens, so 256 pixels stay sharp everywhere it draws them. Icon sets
+// list every size and appearance in no fixed order; the largest default-appearance image is the sharpest source.
+func shelfIcon(metadata: Project, read: (String) throws -> Data?) throws -> String? {
+    let path: String
+    if let iconImage = metadata.iconImage {
+        path = iconImage
     } else {
-        let directory = root.appendingPathComponent("\(metadata.name)/Assets.xcassets/AppIcon.appiconset")
-        let contents = directory.appendingPathComponent("Contents.json")
-        guard files.fileExists(atPath: contents.path) else { return nil }
+        let directory = "\(metadata.name)/Assets.xcassets/AppIcon.appiconset"
+        guard let contents = try read("\(directory)/Contents.json") else {
+            return nil
+        }
         struct Contents: Decodable {
-            struct Image: Decodable { let filename: String? }
+            struct Image: Decodable {
+                let filename: String?
+                let size: String?
+                let scale: String?
+                let appearances: [[String: String]]?
+
+                var pixels: Double {
+                    let points = Double(size?.split(separator: "x").first ?? "") ?? 0
+                    let factor = Double(scale?.dropLast() ?? "") ?? 1
+                    return points * factor
+                }
+            }
             let images: [Image]
         }
-        let catalog = try JSONDecoder().decode(Contents.self, from: Data(contentsOf: contents))
-        guard let filename = catalog.images.compactMap(\.filename).first,
+        let images = try JSONDecoder().decode(Contents.self, from: contents).images.filter { $0.filename != nil && $0.appearances == nil }
+        guard let filename = images.max(by: { $0.pixels < $1.pixels })?.filename,
               !filename.contains("/"), !filename.contains("..") else {
             throw CommandError(message: "Cannot read the app icon for the shelf.")
         }
-        image = directory.appendingPathComponent(filename)
+        path = "\(directory)/\(filename)"
     }
-    guard let source = CGImageSourceCreateWithURL(image as CFURL, nil),
+    guard let data = try read(path),
+          let source = CGImageSourceCreateWithData(data as CFData, nil),
           let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceThumbnailMaxPixelSize: 128
+            kCGImageSourceThumbnailMaxPixelSize: 256
           ] as CFDictionary) else {
         throw CommandError(message: "Cannot read the app icon for the shelf.")
     }
-    let data = NSMutableData()
-    guard let destination = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else {
+    let encoded = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(encoded, "public.png" as CFString, 1, nil) else {
         throw CommandError(message: "Cannot create the shelf icon.")
     }
     CGImageDestinationAddImage(destination, image, nil)
     guard CGImageDestinationFinalize(destination) else { throw CommandError(message: "Cannot encode the shelf icon.") }
-    return (data as Data).base64EncodedString()
+    return (encoded as Data).base64EncodedString()
+}
+
+// Deliveries make each catalog icon, so this brings apps that have not shipped since a change to icons up to date. It
+// reads each app's metadata and icon at its cataloged commit and keeps the existing icon when that is not possible.
+func refreshShelfIcons() throws {
+    let store = try ShelfStore()
+    let (_, catalog) = try store.catalog()
+    let icons = try shelfIcons(catalog, store: store)
+    try withShelfLock {
+        let (release, latest) = try store.catalog()
+        let updated = latest.mapApplications { application in
+            var application = application
+            application.iconPNG = icons[application.packageAssetID] ?? application.iconPNG
+            return application
+        }
+        try store.save(updated, release: release)
+        _ = try store.refresh()
+    }
+    try emit(["result": "shelf-icons-refreshed", "icons": String(icons.count)])
+}
+
+func shelfIcons(_ catalog: ShelfCatalog, store: ShelfStore) throws -> [Int: String] {
+    struct Release: Decodable {
+        struct Asset: Decodable {
+            let id: Int
+        }
+        let tag_name: String
+        let assets: [Asset]
+    }
+    let output = try store.github.call(["api", "--paginate", "--slurp", "repos/\(ShelfStore.repository)/releases?per_page=100"])
+    var repositories: [Int: String] = [:]
+    for release in try store.decoder.decode([[Release]].self, from: Data(output.utf8)).joined() {
+        for asset in release.assets {
+            repositories[asset.id] = release.tag_name.components(separatedBy: "-")[0]
+        }
+    }
+    var icons: [Int: String] = [:]
+    for application in catalog.applications + (catalog.visionApplications ?? []) + (catalog.ownerApplications ?? []) {
+        do {
+            guard let repository = repositories[application.packageAssetID] else {
+                throw CommandError(message: "its package release is missing")
+            }
+            func download(_ path: String) throws -> Data {
+                guard let encodedPath = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
+                    throw CommandError(message: "cannot encode \(path)")
+                }
+                let location = "repos/lucaswkuipers/\(repository)"
+                let sha = try store.github.call(["api", "\(location)/contents/\(encodedPath)?ref=\(application.sourceCommit)", "--jq", ".sha"])
+                let content = try store.github.call(["api", "\(location)/git/blobs/\(sha)", "--jq", ".content"])
+                guard let data = Data(base64Encoded: content, options: .ignoreUnknownCharacters) else {
+                    throw CommandError(message: "GitHub returned an unreadable \(path)")
+                }
+                return data
+            }
+            let metadata = try JSONDecoder().decode(Project.self, from: download(Project.defaultPath))
+            guard metadata.bundleIdentifier == application.bundleIdentifier else {
+                throw CommandError(message: "it is delivered with other metadata in \(repository)")
+            }
+            guard let icon = try shelfIcon(metadata: metadata, read: { try download($0) }) else {
+                throw CommandError(message: "it has no app icon")
+            }
+            icons[application.packageAssetID] = icon
+        } catch {
+            status("Kept the catalog icon of \(application.name): \(error.localizedDescription)")
+        }
+    }
+    return icons
 }
 
 func shelfReleaseNotes(github: PersonalGitHub, name: String, previous: String?, commit: String) throws -> [String] {

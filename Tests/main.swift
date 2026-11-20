@@ -362,6 +362,24 @@ do {
     try files.createDirectory(at: empty, withIntermediateDirectories: true)
     try expectFailure { _ = try sourceFingerprint(empty) }
 
+    let iconRoot = temporary.appendingPathComponent("IconApp")
+    let iconSet = iconRoot.appendingPathComponent("IconApp/Assets.xcassets/AppIcon.appiconset")
+    try files.createDirectory(at: iconSet, withIntermediateDirectories: true)
+    for (name, pixels) in [("small.png", 40), ("large.png", 1024), ("dark.png", 1024)] {
+        try Data(base64Encoded: shelfIconFixture(pixels: pixels, noisy: false))!.write(to: iconSet.appendingPathComponent(name))
+    }
+    try Data("""
+    {"images": [
+        {"filename": "small.png", "idiom": "universal", "platform": "ios", "scale": "2x", "size": "20x20"},
+        {"appearances": [{"appearance": "luminosity", "value": "dark"}], "filename": "dark.png", "idiom": "universal", "platform": "ios", "size": "1024x1024"},
+        {"filename": "large.png", "idiom": "universal", "platform": "ios", "size": "1024x1024"}
+    ]}
+    """.utf8).write(to: iconSet.appendingPathComponent("Contents.json"))
+    let iconProject = Project(name: "IconApp", bundleIdentifier: "com.lucaswkuipers.IconApp", delivery: .shelf, xcodeProject: nil, scheme: nil, prepareScript: nil)
+    let shelfIconData = Data(base64Encoded: try shelfIcon(root: iconRoot, metadata: iconProject)!)!
+    let shelfIconProperties = CGImageSourceCopyPropertiesAtIndex(CGImageSourceCreateWithData(shelfIconData as CFData, nil)!, 0, nil) as! [CFString: Any]
+    try expect(shelfIconProperties[kCGImagePropertyPixelWidth] as? Int == 256, "Shelf icons come from the largest light icon at 256 pixels, sharp at 80 points on 3x screens")
+
     let state = DeliveryState(fingerprint: second, appID: "123", bundleIdentifier: "com.lucaswkuipers.Test", buildNumber: "1", archivePath: "/tmp/test.xcarchive", phase: "upload-started")
     let stateURL = temporary.appendingPathComponent("state.json")
     try state.save(stateURL)

@@ -198,6 +198,7 @@ do {
         uikit-app package <project-directory> --build <number>
         uikit-app direct <project-directory> [--metadata <path-in-repository>]
         uikit-app refresh-shelf
+        uikit-app refresh-shelf-icons
         uikit-app setup-shelf-refresh
         uikit-app setup-shelf-installs
         uikit-app share-shelf [--device <iPhone-UDID> --name <device-name> | --remove <device-name-or-UDID>]
@@ -228,6 +229,8 @@ do {
         try login()
     } else if arguments == ["refresh-shelf"] {
         try refreshShelf()
+    } else if arguments == ["refresh-shelf-icons"] {
+        try refreshShelfIcons()
     } else if arguments == ["setup-shelf-refresh"] {
         try setupShelfRefresh()
     } else if arguments == ["setup-shelf-installs"] {
